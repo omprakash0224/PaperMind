@@ -15,8 +15,9 @@ from qdrant_client.models import (
 )
 
 from app.config import get_settings
+from app.services.bm25 import BM25Encoder, get_bm25_encoder
 
-logger = logging.getLogger(__name__)
+logger   = logging.getLogger(__name__)
 settings = get_settings()
 
 SPARSE_VECTOR_NAME = "text-sparse"
@@ -29,8 +30,7 @@ _qdrant_client: QdrantClient | None = None
 def get_qdrant_client() -> QdrantClient:
     """
     Returns a module-level singleton QdrantClient.
-    Uses local on-disk persistence via qdrant_client's built-in storage.
-    Uses Qdrant Cloud if QDRANT_URL and QDRANT_API_KEY are set in config.
+    Uses Qdrant Cloud if QDRANT_URL + QDRANT_API_KEY are set, otherwise local disk.
     """
     global _qdrant_client
     if _qdrant_client is None:
@@ -46,21 +46,37 @@ def get_qdrant_client() -> QdrantClient:
     return _qdrant_client
 
 
+def get_sparse_encoder() -> BM25Encoder:
+    """
+    Returns the pure-Python BM25 encoder singleton.
+
+    No external dependencies — uses only Python stdlib (re, hashlib).
+    Works on any Python version including 3.14.
+
+    Qdrant handles IDF weighting server-side via Modifier.IDF on the
+    sparse vector field. This encoder only supplies raw TF weights.
+    """
+    return get_bm25_encoder()
+
+
 def ensure_collection() -> None:
     """
     Create the Qdrant collection if it doesn't exist yet.
 
     Collection schema:
-      • Dense vectors  → Google embedding (cosine)
-      • Sparse vectors → BM25 keyword index (named "text-sparse")
+      • Dense vectors  → Google Gemini embeddings (cosine similarity)
+      • Sparse vectors → BM25 keyword index named "text-sparse"
                          only created when ENABLE_HYBRID_SEARCH=True
 
-    ⚠️  If you toggle ENABLE_HYBRID_SEARCH after a collection already exists,
-    the sparse index WON'T be added retroactively. You must either:
-      a) Delete the collection and re-ingest all documents, or
-      b) Call client.update_collection() to add the sparse vector config.
+    Modifier.IDF instructs Qdrant to apply inverse document frequency
+    weighting at query time — correct for BM25 (client supplies TF,
+    Qdrant applies IDF). This would be Modifier.NONE for SPLADE.
+
+    ⚠️  Toggling ENABLE_HYBRID_SEARCH after a collection already exists
+    will NOT retroactively add/remove the sparse index. You must delete
+    the collection and re-ingest all documents to change the schema.
     """
-    client = get_qdrant_client()
+    client   = get_qdrant_client()
     existing = [c.name for c in client.get_collections().collections]
 
     if settings.COLLECTION_NAME not in existing:
@@ -100,16 +116,7 @@ def ensure_collection() -> None:
 def _build_tenant_filter(user_id: str, filename: str | None = None) -> Filter:
     """
     Build a Qdrant Filter scoped to a single tenant.
-
-    Always filters by metadata.user_id (mandatory).
-    Optionally narrows to a specific document via metadata.source.
-
-    This matches the metadata keys stamped during ingestion:
-        metadata = {
-            "source":    filename,   ← matched by filename param
-            "user_id":   user_id,    ← always matched
-            ...
-        }
+    Always filters by metadata.user_id. Optionally narrows to one document.
     """
     conditions = [
         FieldCondition(key="metadata.user_id", match=MatchValue(value=user_id))
@@ -130,12 +137,9 @@ def get_langchain_vectorstore(
     """
     Returns a LangChain QdrantVectorStore wrapper around the singleton client.
 
-    Args:
-        embeddings: Optional pre-built embeddings instance to reuse.
-        user_id:    When provided, all similarity searches on this store
-                    are automatically scoped to that tenant's chunks only.
-                    Pass None only during ingestion (tenant is enforced by
-                    metadata stamping, not by query filter).
+    Used for dense-only retrieval fallback (ENABLE_HYBRID_SEARCH=False).
+    For hybrid ingestion we bypass this and upsert via the Qdrant client
+    directly so we can include both dense + sparse vectors in one call.
     """
     if embeddings is None:
         embeddings = GoogleGenerativeAIEmbeddings(
@@ -162,14 +166,11 @@ def get_langchain_vectorstore(
 
 def delete_document(filename: str, user_id: str) -> int:
     """
-    Delete all chunks matching both *filename* and *user_id*.
-
-    Tenant isolation is enforced — a user can only delete their own chunks
-    even if another user has a document with the same filename.
-
-    Returns the number of chunks deleted, or 0 if none were found.
+    Delete all chunks matching both filename and user_id.
+    Tenant isolation is enforced — users can only delete their own documents.
+    Returns the number of chunks deleted, or 0 if none found.
     """
-    client = get_qdrant_client()
+    client        = get_qdrant_client()
     tenant_filter = _build_tenant_filter(user_id, filename)
 
     count_result = client.count(
@@ -201,15 +202,12 @@ def delete_document(filename: str, user_id: str) -> int:
 def list_documents(user_id: str) -> list[dict]:
     """
     Return a list of distinct documents for a specific tenant.
-
     Each entry: {filename, document_id, chunks_count}.
-
-    Scrolls through only the tenant's chunks (filtered by metadata.user_id)
-    and groups them by source filename in Python.
+    Scrolls through only the tenant's chunks and groups by source filename.
     """
-    client = get_qdrant_client()
-
+    client   = get_qdrant_client()
     existing = [c.name for c in client.get_collections().collections]
+
     if settings.COLLECTION_NAME not in existing:
         return []
 
@@ -230,7 +228,7 @@ def list_documents(user_id: str) -> list[dict]:
     while True:
         records, offset = client.scroll(
             collection_name=settings.COLLECTION_NAME,
-            scroll_filter=tenant_filter,   # ← only this tenant's chunks
+            scroll_filter=tenant_filter,
             with_payload=True,
             with_vectors=False,
             limit=100,
