@@ -61,6 +61,17 @@ class Settings(BaseSettings):
     QDRANT_URL: str | None = None
     QDRANT_API_KEY: str | None = None
 
+    # ── Upstash Redis (leave unset for local dev) ─────────────────────────────
+    # Used to store document ingestion job status across restarts and workers.
+    # Falls back to an in-memory dict when these are not set (local dev only).
+    #
+    # Get these from: https://console.upstash.com
+    #   1. Create a Redis database
+    #   2. Copy "REST URL" → UPSTASH_REDIS_REST_URL
+    #   3. Copy "REST Token" → UPSTASH_REDIS_REST_TOKEN
+    UPSTASH_REDIS_REST_URL:   str | None = None
+    UPSTASH_REDIS_REST_TOKEN: str | None = None
+
     # Cloudinary (leave unset for local dev)
     CLOUDINARY_CLOUD_NAME: str | None = None
     CLOUDINARY_API_KEY: str | None = None
@@ -77,6 +88,11 @@ class Settings(BaseSettings):
     @property
     def use_qdrant_cloud(self) -> bool:
         return bool(self.QDRANT_URL and self.QDRANT_API_KEY)
+    
+    @property
+    def use_redis(self) -> bool:
+        """True when Upstash Redis credentials are configured."""
+        return bool(self.UPSTASH_REDIS_REST_URL and self.UPSTASH_REDIS_REST_TOKEN)
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
