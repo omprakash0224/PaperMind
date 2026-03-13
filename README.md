@@ -9,7 +9,7 @@
 ![Qdrant](https://img.shields.io/badge/Qdrant-Vector%20DB-DC244C?style=for-the-badge&logo=qdrant&logoColor=white)
 ![Google Gemini](https://img.shields.io/badge/Google%20Gemini-2.5-4285F4?style=for-the-badge&logo=google&logoColor=white)
 ![Clerk](https://img.shields.io/badge/Clerk-Auth-6C47FF?style=for-the-badge&logo=clerk&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-22C55E?style=for-the-badge)
+![License](https://img.shields.io/pypi/l/pytest-html-cn)
 
 **A production-grade Retrieval-Augmented Generation (RAG) application for intelligent document Q&A.**  
 Upload PDFs and DOCX files, then ask natural-language questions grounded in your content.
