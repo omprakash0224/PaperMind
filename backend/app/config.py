@@ -1,7 +1,7 @@
 from functools import lru_cache
+import json
 
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
 
 class Settings(BaseSettings):
     GOOGLE_API_KEY: str
@@ -20,24 +20,20 @@ class Settings(BaseSettings):
     # Prod: https://clerk.<yourdomain>.com
     CLERK_ISSUER: str
 
-    CORS_ORIGINS: list[str] = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://paper-mind-rho.vercel.app",
-    ]
+    # Store as a plain string so pydantic-settings won't try to JSON-decode it.
+    # Set the env var as comma-separated origins, e.g.:
+    #   CORS_ORIGINS=https://paper-mind-rho.vercel.app,http://localhost:3000
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,https://paper-mind-rho.vercel.app"
 
-    @field_validator("CORS_ORIGINS", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v: object) -> list[str]:
-        if isinstance(v, str):
-            v = v.strip()
-            if not v:
-                return []
-            if v.startswith("["):
-                import json
-                return json.loads(v)
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse CORS_ORIGINS string into a list."""
+        v = self.CORS_ORIGINS.strip()
+        if not v:
+            return []
+        if v.startswith("["):
+            return json.loads(v)
+        return [origin.strip() for origin in v.split(",") if origin.strip()]
 
     # ── Retrieval quality settings ────────────────────────────────────────────
 
