@@ -20,7 +20,11 @@ class Settings(BaseSettings):
     # Prod: https://clerk.<yourdomain>.com
     CLERK_ISSUER: str
 
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://paper-mind-rho.vercel.app",
+    ]
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
