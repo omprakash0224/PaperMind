@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Starting RAG Document Q&A API...")
     logger.info("Auth provider: Clerk | issuer=%s", settings.CLERK_ISSUER)
+    logger.info("CORS allowed origins: %s", settings.cors_origins_list)
 
     # Ensure upload + Qdrant dirs exist
     for directory in [Path(settings.UPLOAD_DIR), Path(settings.QDRANT_PERSIST_DIR)]:
@@ -90,8 +91,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "Accept"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(upload_router)   # /api/documents/* — Clerk-protected
