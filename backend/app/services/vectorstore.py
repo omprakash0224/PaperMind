@@ -12,6 +12,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    PayloadSchemaType,
 )
 
 from app.config import get_settings
@@ -57,6 +58,29 @@ def get_sparse_encoder() -> BM25Encoder:
     sparse vector field. This encoder only supplies raw TF weights.
     """
     return get_bm25_encoder()
+
+
+def _ensure_payload_indexes(client: QdrantClient) -> None:
+    """
+    Create payload indexes required for filtered queries.
+
+    Qdrant Cloud requires explicit indexes on fields used in filters.
+    Creating an index that already exists is a safe no-op.
+    """
+    for field_name in ("metadata.user_id", "metadata.source"):
+        try:
+            client.create_payload_index(
+                collection_name=settings.COLLECTION_NAME,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            logger.info("Payload index ensured: %s (keyword)", field_name)
+        except Exception as exc:
+            # Index may already exist — that's fine
+            if "already exists" in str(exc).lower():
+                logger.debug("Payload index already exists: %s", field_name)
+            else:
+                logger.warning("Could not create payload index '%s': %s", field_name, exc)
 
 
 def ensure_collection() -> None:
@@ -109,6 +133,9 @@ def ensure_collection() -> None:
         )
     else:
         logger.debug("Collection '%s' already exists.", settings.COLLECTION_NAME)
+
+    # Always ensure payload indexes exist (idempotent)
+    _ensure_payload_indexes(client)
 
 
 # ── Tenant isolation helper ───────────────────────────────────────────────────
