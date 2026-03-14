@@ -61,8 +61,41 @@ def download_for_processing(file_url_or_path: str, suffix: str) -> str:
     if file_url_or_path.startswith("http"):
         import httpx
         logger.info("Downloading file from Cloudinary for processing...")
+
+        # If Cloudinary is configured, generate a signed URL for authenticated access
+        download_url = file_url_or_path
+        if is_cloud_storage_enabled():
+            try:
+                import cloudinary.utils
+                _get_cloudinary()
+                # Extract the public_id from the URL
+                # URL format: .../raw/upload/v.../rag_uploads/filename.ext
+                parts = file_url_or_path.split("/raw/upload/")
+                if len(parts) == 2:
+                    # Remove version prefix (v1234567890/) to get public_id.ext
+                    path_after_upload = parts[1]
+                    # Remove version segment if present
+                    segments = path_after_upload.split("/", 1)
+                    if len(segments) == 2 and segments[0].startswith("v"):
+                        resource_path = segments[1]
+                    else:
+                        resource_path = path_after_upload
+                    # Remove file extension for public_id
+                    public_id = str(Path(resource_path).with_suffix(""))
+                    signed_url, _ = cloudinary.utils.cloudinary_url(
+                        public_id,
+                        resource_type="raw",
+                        sign_url=True,
+                        type="upload",
+                    )
+                    if signed_url:
+                        download_url = signed_url
+                        logger.info("Using signed Cloudinary URL for download.")
+            except Exception as exc:
+                logger.warning("Could not generate signed URL, using original: %s", exc)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            response = httpx.get(file_url_or_path)
+            response = httpx.get(download_url)
             response.raise_for_status()
             tmp.write(response.content)
             tmp_path = tmp.name
