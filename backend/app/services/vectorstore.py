@@ -67,7 +67,7 @@ def _ensure_payload_indexes(client: QdrantClient) -> None:
     Qdrant Cloud requires explicit indexes on fields used in filters.
     Creating an index that already exists is a safe no-op.
     """
-    for field_name in ("metadata.user_id", "metadata.source"):
+    for field_name in ("metadata.user_id", "metadata.source", "metadata.file_hash"):
         try:
             client.create_payload_index(
                 collection_name=settings.COLLECTION_NAME,
