@@ -115,9 +115,6 @@ source venv/bin/activate      # Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt  
-# After this, if Import "langchain_text_splitters" could not be resolved error occurs, try 
-
-pip install langchain-text-splitters
 
 # Copy and configure environment variables
 cp .env.example .env
