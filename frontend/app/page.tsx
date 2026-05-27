@@ -55,7 +55,7 @@ export default function Home() {
             Q
           </div>
           <h1 className="text-sm font-semibold tracking-tight text-zinc-100">
-            Document Q&amp;A
+            PaperMind - Document Q&amp;A
           </h1>
         </div>
 
