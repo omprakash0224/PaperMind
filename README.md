@@ -88,6 +88,15 @@ For a detailed breakdown of every service, data flow, and design decision, see [
 
 ---
 
+## Screenshots
+
+![Homepage Screenshot](docs/screenshots/homepage.png)
+![BackendProcess Page](docs/screenshots/backendprocess.png)
+
+![Demo GIF](docs/screenshots/demo.gif)
+
+---
+
 ## Installation
 
 ### Prerequisites
