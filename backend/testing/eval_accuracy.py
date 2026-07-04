@@ -1,5 +1,5 @@
 """
-CerviCare / PaperMind accuracy eval — 25 real questions across 3 documents.
+PaperMind accuracy eval — 25 real questions across 3 documents.
 
 Documents expected to be ingested under your account:
   1. CerviCare Synopsis (project report / synopsis PDF)
@@ -16,10 +16,14 @@ BEFORE YOU RUN
 
 RUN
   pip install httpx --break-system-packages
-  python eval_cervicare.py --token "PASTE_TOKEN_HERE"
+  python eval_accuracy.py --token "PASTE_TOKEN_HERE"
 
 OUTPUT
   Per-question pass/fail + final score to cite on your resume.
+
+RATE LIMITS (Gemini free tier)
+  5 RPM  →  one request every 13 s (with 8 s safety buffer)
+  20 RPD →  eval is capped; script warns and stops before the limit
 """
 
 import argparse
@@ -31,6 +35,15 @@ import time
 import httpx
 
 BASE_URL = "http://localhost:8000"
+
+# ── Gemini free-tier guardrails ───────────────────────────────────────────────
+# 5 RPM  → minimum 12 s between requests; we use 13 s for safety headroom.
+# 20 RPD → hard stop when we've consumed this many requests in one run.
+RPM_LIMIT        = 5
+RPD_LIMIT        = 20
+MIN_INTERVAL_SEC = 60 / RPM_LIMIT + 1   # 13 s between requests
+MAX_RETRIES      = 3                     # retries on HTTP 429 / 5xx
+BACKOFF_BASE_SEC = 15                    # first retry wait (doubles each time)
 
 # ── Set these to the exact filenames in your Qdrant/Cloudinary store ──────────
 # Leave as None to search across all ingested documents (still works, slightly
@@ -220,52 +233,148 @@ def is_no_info(answer: str) -> bool:
     return any(p in a for p in NO_INFO_PHRASES)
 
 
-async def run_question(client: httpx.AsyncClient, headers: dict, item: dict) -> dict:
+async def run_question(
+    client: httpx.AsyncClient,
+    headers: dict,
+    item: dict,
+    request_index: int,
+    total: int,
+) -> dict:
+    """POST one question to /api/query with retry logic for 429 / 5xx."""
     payload = {
         "question": item["question"],
         "document_filter": item.get("document_filter"),
     }
-    start = time.monotonic()
-    try:
-        resp = await client.post(f"{BASE_URL}/api/query", json=payload, headers=headers, timeout=60.0)
-        elapsed = time.monotonic() - start
-        if resp.status_code != 200:
-            return {**item, "ok": False, "error": f"HTTP {resp.status_code}", "ms": elapsed * 1000}
-        data = resp.json()
-        answer = data.get("answer", "")
-        sources = len(data.get("sources", []))
-        passed = grade(answer, item["expect_any"])
-        no_info = is_no_info(answer)
-        return {**item, "ok": True, "passed": passed, "no_info": no_info, "answer": answer, "sources": sources, "ms": elapsed * 1000}
-    except httpx.RequestError as exc:
-        elapsed = time.monotonic() - start
-        return {**item, "ok": False, "error": str(exc), "ms": elapsed * 1000}
+    for attempt in range(1, MAX_RETRIES + 1):
+        start = time.monotonic()
+        try:
+            resp = await client.post(
+                f"{BASE_URL}/api/query",
+                json=payload,
+                headers=headers,
+                timeout=90.0,
+            )
+            elapsed = time.monotonic() - start
+
+            if resp.status_code == 429:
+                wait = BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+                print(
+                    f"  ⚠️  [Q{request_index}/{total}] Rate-limited (429). "
+                    f"Waiting {wait}s before retry {attempt}/{MAX_RETRIES} …"
+                )
+                await asyncio.sleep(wait)
+                continue  # retry
+
+            if resp.status_code >= 500:
+                wait = BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+                print(
+                    f"  ⚠️  [Q{request_index}/{total}] Server error {resp.status_code}. "
+                    f"Waiting {wait}s before retry {attempt}/{MAX_RETRIES} …"
+                )
+                await asyncio.sleep(wait)
+                continue  # retry
+
+            if resp.status_code != 200:
+                return {
+                    **item,
+                    "ok": False,
+                    "error": f"HTTP {resp.status_code}",
+                    "ms": elapsed * 1000,
+                }
+
+            data = resp.json()
+            answer = data.get("answer", "")
+            sources = len(data.get("sources", []))
+            passed = grade(answer, item["expect_any"])
+            no_info = is_no_info(answer)
+            return {
+                **item,
+                "ok": True,
+                "passed": passed,
+                "no_info": no_info,
+                "answer": answer,
+                "sources": sources,
+                "ms": elapsed * 1000,
+            }
+
+        except httpx.RequestError as exc:
+            elapsed = time.monotonic() - start
+            if attempt == MAX_RETRIES:
+                return {**item, "ok": False, "error": str(exc), "ms": elapsed * 1000}
+            wait = BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+            print(f"  ⚠️  [Q{request_index}/{total}] Request error: {exc}. Retrying in {wait}s …")
+            await asyncio.sleep(wait)
+
+    # All retries exhausted
+    return {**item, "ok": False, "error": "Max retries exceeded (429 / server error)", "ms": 0}
 
 
-async def main_async(token: str, concurrency: int):
+async def main_async(token: str):
+    """Run all questions sequentially, respecting Gemini free-tier limits."""
     headers = {"Authorization": f"Bearer {token}"}
-    semaphore = asyncio.Semaphore(concurrency)
+    total = len(QUESTIONS)
 
-    async def bounded(client, item):
-        async with semaphore:
-            return await run_question(client, headers, item)
+    # Warn if the eval set alone would exceed the daily budget.
+    if total > RPD_LIMIT:
+        print(
+            f"\n⚠️  WARNING: {total} questions exceed the Gemini free-tier daily limit "
+            f"of {RPD_LIMIT} RPD.\n"
+            f"   Only the first {RPD_LIMIT} questions will be evaluated.\n"
+        )
+        questions_to_run = QUESTIONS[:RPD_LIMIT]
+    else:
+        questions_to_run = QUESTIONS
+
+    effective_total = len(questions_to_run)
+    estimated_minutes = (effective_total * MIN_INTERVAL_SEC) / 60
+    print(
+        f"Running {effective_total} questions sequentially."
+        f"  (Gemini free tier: ≤{RPM_LIMIT} RPM / ≤{RPD_LIMIT} RPD)\n"
+        f"Estimated time: ~{estimated_minutes:.1f} minutes\n"
+        f"  — one request every {MIN_INTERVAL_SEC:.0f} s with retries on 429 errors\n"
+    )
+
+    results = []
+    last_request_time: float | None = None
 
     async with httpx.AsyncClient() as client:
-        tasks = [bounded(client, q) for q in QUESTIONS]
-        results = await asyncio.gather(*tasks)
+        for idx, item in enumerate(questions_to_run, start=1):
+            # ── Enforce minimum inter-request gap ─────────────────────────────
+            if last_request_time is not None:
+                elapsed_since_last = time.monotonic() - last_request_time
+                gap_needed = MIN_INTERVAL_SEC - elapsed_since_last
+                if gap_needed > 0:
+                    print(f"  ⏳ Waiting {gap_needed:.1f}s to respect rate limit …")
+                    await asyncio.sleep(gap_needed)
+
+            print(f"  ▶ [{idx}/{effective_total}] {item['section']} — {item['question'][:70]}…")
+            last_request_time = time.monotonic()
+            result = await run_question(client, headers, item, idx, effective_total)
+
+            status_icon = (
+                "✅" if result.get("passed")
+                else "⚠️ " if result.get("no_info")
+                else "❌" if result.get("ok")
+                else "💥"
+            )
+            print(f"     {status_icon} done in {result.get('ms', 0):.0f}ms")
+            results.append(result)
 
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description="CerviCare 25-question accuracy eval")
-    parser.add_argument("--token", required=True)
-    parser.add_argument("--concurrency", type=int, default=5,
-                        help="Max parallel requests (keep low to avoid Gemini rate limits)")
+    parser.add_argument("--token", required=True, help="Clerk bearer token")
     args = parser.parse_args()
 
-    print(f"\nRunning {len(QUESTIONS)} questions | concurrency={args.concurrency}\n")
-    results = asyncio.run(main_async(args.token, args.concurrency))
+    print(f"\n{'=' * 60}")
+    print(f"PaperMind / CerviCare Accuracy Eval")
+    print(f"{'=' * 60}")
+    print(f"Gemini free-tier mode: {RPM_LIMIT} RPM / {RPD_LIMIT} RPD")
+    print(f"Questions in eval set: {len(QUESTIONS)}")
+    print(f"{'=' * 60}\n")
+    results = asyncio.run(main_async(args.token))
 
     # ── Per-section breakdown ─────────────────────────────────────────────────
     sections = {}
