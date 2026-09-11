@@ -1,3 +1,14 @@
+"""
+storage.py -- Cloudflare R2 storage backend (replaces Cloudinary).
+
+Upload backend:
+  Production  -> Cloudflare R2 (R2_* env vars set)
+  Development -> Local disk (no env vars needed)
+
+R2 is S3-compatible; we use boto3 with a custom endpoint_url.
+Zero egress fees mean downloading for processing is always free.
+"""
+
 import logging
 import os
 import tempfile
@@ -5,117 +16,160 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_KEY_PREFIX = "rag-uploads"
+
 
 def is_cloud_storage_enabled() -> bool:
-    """Returns True if all Cloudinary env vars are set."""
+    """Returns True if all R2 env vars are set."""
     from app.config import get_settings
-    s = get_settings()
-    return bool(s.CLOUDINARY_CLOUD_NAME and s.CLOUDINARY_API_KEY and s.CLOUDINARY_API_SECRET)
+    return get_settings().use_r2
 
 
-def _get_cloudinary():
-    """Configure and return cloudinary module."""
-    import cloudinary
-    import cloudinary.uploader
-    from app.config import get_settings
-    s = get_settings()
-    cloudinary.config(
-        cloud_name=s.CLOUDINARY_CLOUD_NAME,
-        api_key=s.CLOUDINARY_API_KEY,
-        api_secret=s.CLOUDINARY_API_SECRET,
-    )
-    return cloudinary
-
-
-def upload_file(local_path: str, filename: str) -> str:
+def _get_r2_client():
     """
-    Upload file to Cloudinary (prod) or keep local path (dev).
-    Returns the path/URL to use for ingestion.
+    Build and return a boto3 S3 client configured for Cloudflare R2.
+
+    R2 is S3-compatible but uses a custom endpoint_url:
+      https://{account_id}.r2.cloudflarestorage.com
+
+    boto3 is used because:
+      - Standard S3 API -- no vendor lock-in
+      - Pre-signed URLs are one-liners
+      - Multipart upload available if needed later
+    """
+    import boto3
+    from app.config import get_settings
+    s = get_settings()
+    return boto3.client(
+        "s3",
+        endpoint_url=s.R2_ENDPOINT_URL,
+        aws_access_key_id=s.R2_ACCESS_KEY_ID,
+        aws_secret_access_key=s.R2_SECRET_ACCESS_KEY,
+        region_name="auto",  # R2 ignores region but boto3 requires it
+    )
+
+
+def _r2_key(user_id: str, document_id: str, filename: str) -> str:
+    """
+    Build an R2 object key scoped by user.
+
+    Format: rag-uploads/{user_id}/{document_id}{.ext}
+
+    Scoping by user_id means:
+      - Files are naturally partitioned per tenant
+      - Listing a user's files is a prefix scan
+      - No accidental cross-tenant access via guessable filenames
+    """
+    suffix = Path(filename).suffix.lower()
+    return f"{_KEY_PREFIX}/{user_id}/{document_id}{suffix}"
+
+
+def _content_type(filename: str) -> str:
+    """Return the correct MIME type for supported file types."""
+    suffix = Path(filename).suffix.lower()
+    return {
+        ".pdf":  "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }.get(suffix, "application/octet-stream")
+
+
+def upload_file(
+    local_path: str,
+    filename: str,
+    *,
+    user_id: str,
+    document_id: str,
+) -> str:
+    """
+    Upload file to Cloudflare R2 (prod) or keep local path (dev).
+    Returns the R2 object key (prod) or the local path (dev).
+
+    Note: signature adds `user_id` and `document_id` keyword-only args
+    vs the old Cloudinary version. Callers (upload.py) already have both.
     """
     if not is_cloud_storage_enabled():
-        logger.info("Cloud storage disabled — using local path: %s", local_path)
+        logger.info("Cloud storage disabled -- using local path: %s", local_path)
         return local_path
 
-    import cloudinary.uploader
-    _get_cloudinary()
+    from app.config import get_settings
+    s = get_settings()
+    client = _get_r2_client()
+    key = _r2_key(user_id, document_id, filename)
 
-    logger.info("Uploading '%s' to Cloudinary...", filename)
-    result = cloudinary.uploader.upload(
-        local_path,
-        resource_type="raw",          # required for PDF/DOCX (non-image)
-        public_id=f"rag_uploads/{Path(local_path).stem}",
-        overwrite=False,
-        use_filename=True,
+    logger.info("Uploading '%s' to R2 key '%s'...", filename, key)
+    client.upload_file(
+        Filename=local_path,
+        Bucket=s.R2_BUCKET_NAME,
+        Key=key,
+        ExtraArgs={"ContentType": _content_type(filename)},
     )
-    url = result["secure_url"]
-    logger.info("Uploaded to Cloudinary: %s", url)
+    logger.info("Uploaded to R2: %s", key)
+    return key  # return the object key; generate pre-signed URLs on demand
+
+
+def generate_download_url(r2_key: str, expires_in: int = 3600) -> str:
+    """
+    Generate a pre-signed R2 URL valid for `expires_in` seconds (default 1 hour).
+    Used by the ingestion worker to download the file for processing.
+
+    Pre-signed URLs keep the bucket private while allowing time-limited access.
+    """
+    from app.config import get_settings
+    s = get_settings()
+    client = _get_r2_client()
+    url = client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": s.R2_BUCKET_NAME, "Key": r2_key},
+        ExpiresIn=expires_in,
+    )
+    logger.debug("Generated pre-signed R2 URL for key '%s' (expires=%ds).", r2_key, expires_in)
     return url
 
 
 def download_for_processing(file_url_or_path: str, suffix: str) -> str:
     """
-    If file_url_or_path is a remote URL, download to a temp file and return
-    the temp path. Otherwise return as-is (already a local path).
-    Used so ingestion.py always works with a local file path.
+    Resolve a file reference to a local temp path for ingestion.
+
+    Three modes:
+      1. Local path (dev)         -> return as-is
+      2. R2 object key (no http)  -> generate pre-signed URL, then download
+      3. Direct HTTP URL          -> download directly
+
+    This is the single entry point ingestion.py uses to get a local file,
+    abstracting over all storage backends.
     """
-    if file_url_or_path.startswith("http"):
-        import httpx
-        logger.info("Downloading file from Cloudinary for processing...")
+    # Local file -- dev mode
+    if not file_url_or_path.startswith("http") and os.path.exists(file_url_or_path):
+        return file_url_or_path
 
-        # If Cloudinary is configured, generate a signed URL for authenticated access
-        download_url = file_url_or_path
-        if is_cloud_storage_enabled():
-            try:
-                import cloudinary.utils
-                _get_cloudinary()
-                # Extract the public_id from the URL
-                # URL format: .../raw/upload/v.../rag_uploads/filename.ext
-                parts = file_url_or_path.split("/raw/upload/")
-                if len(parts) == 2:
-                    # Remove version prefix (v1234567890/) to get public_id.ext
-                    path_after_upload = parts[1]
-                    # Remove version segment if present
-                    segments = path_after_upload.split("/", 1)
-                    if len(segments) == 2 and segments[0].startswith("v"):
-                        resource_path = segments[1]
-                    else:
-                        resource_path = path_after_upload
-                    # Remove file extension for public_id
-                    public_id = str(Path(resource_path).with_suffix(""))
-                    signed_url, _ = cloudinary.utils.cloudinary_url(
-                        public_id,
-                        resource_type="raw",
-                        sign_url=True,
-                        type="upload",
-                    )
-                    if signed_url:
-                        download_url = signed_url
-                        logger.info("Using signed Cloudinary URL for download.")
-            except Exception as exc:
-                logger.warning("Could not generate signed URL, using original: %s", exc)
+    # R2 object key -- generate a pre-signed URL first
+    download_url = file_url_or_path
+    if not file_url_or_path.startswith("http"):
+        logger.info("R2 key detected -- generating pre-signed URL: %s", file_url_or_path)
+        download_url = generate_download_url(file_url_or_path)
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            response = httpx.get(download_url)
-            response.raise_for_status()
-            tmp.write(response.content)
-            tmp_path = tmp.name
-        logger.info("Downloaded to temp file: %s", tmp_path)
-        return tmp_path
-    return file_url_or_path
+    # Download from URL to a temp file
+    import httpx
+    logger.info("Downloading file for processing...")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        response = httpx.get(download_url, timeout=120)
+        response.raise_for_status()
+        tmp.write(response.content)
+        tmp_path = tmp.name
+    logger.info("Downloaded to temp file: %s", tmp_path)
+    return tmp_path
 
 
-def delete_file(filename: str) -> None:
-    """Delete file from Cloudinary (prod) or local disk (dev)."""
+def delete_file(r2_key: str) -> None:
+    """Delete an object from R2 (prod) or no-op (dev)."""
     if not is_cloud_storage_enabled():
-        return  # local file cleanup is handled in upload.py already
+        return  # local file cleanup is handled in upload.py
 
-    import cloudinary.uploader
-    _get_cloudinary()
-
-    stem = Path(filename).stem[:64]
-    public_id = f"rag_uploads/{stem}"
+    from app.config import get_settings
+    s = get_settings()
+    client = _get_r2_client()
     try:
-        cloudinary.uploader.destroy(public_id, resource_type="raw")
-        logger.info("Deleted from Cloudinary: %s", public_id)
+        client.delete_object(Bucket=s.R2_BUCKET_NAME, Key=r2_key)
+        logger.info("Deleted from R2: %s", r2_key)
     except Exception as exc:
-        logger.warning("Could not delete '%s' from Cloudinary: %s", public_id, exc)
+        logger.warning("Could not delete '%s' from R2: %s", r2_key, exc)

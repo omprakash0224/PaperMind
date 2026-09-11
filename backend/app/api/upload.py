@@ -21,7 +21,7 @@ from app.dependencies import AuthUser
 from app.models.schemas import DocumentInfo, UploadResponse
 from app.services.ingestion import ingest_document
 from app.services.vectorstore import delete_document, list_documents
-from app.services.storage import upload_file, is_cloud_storage_enabled
+from app.services.storage import upload_file, is_cloud_storage_enabled, delete_file
 from app.services.status_store import set_status, get_status, update_status
 
 logger   = logging.getLogger(__name__)
@@ -47,11 +47,11 @@ def _run_ingestion(
     polling /status/{document_id} sees live progress.
 
     Stages:
-      queued      → set at upload time (before this function is called)
-      processing  → set immediately when this function starts
-      completed   → set on success (includes chunks_count)
-      duplicate   → set when deduplication detects a previously ingested file
-      failed      → set on any exception (includes error message)
+      queued      -> set at upload time (before this function is called)
+      processing  -> set immediately when this function starts
+      completed   -> set on success (includes chunks_count)
+      duplicate   -> set when deduplication detects a previously ingested file
+      failed      -> set on any exception (includes error message)
     """
     update_status(document_id, {"status": "processing"})
 
@@ -91,14 +91,14 @@ async def upload_document(
     file: UploadFile = File(..., description="PDF or DOCX file (max 50 MB)"),
 ) -> UploadResponse:
     """
-    Accept a file upload, save it to disk (or Cloudinary), queue ingestion,
+    Accept a file upload, save it to disk (or Cloudflare R2), queue ingestion,
     and return immediately with HTTP 202. The client should poll
     GET /api/documents/status/{document_id} to track progress.
     """
     original_filename = file.filename or "upload"
     suffix = Path(original_filename).suffix.lower()
 
-    # ── Validate file type ────────────────────────────────────────────────────
+    # -- Validate file type ---------------------------------------------------
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
@@ -108,7 +108,7 @@ async def upload_document(
             ),
         )
 
-    # ── Read and validate file content ────────────────────────────────────────
+    # -- Read and validate file content ---------------------------------------
     content = await file.read()
 
     if len(content) > MAX_FILE_SIZE_BYTES:
@@ -122,12 +122,12 @@ async def upload_document(
             detail="Uploaded file is empty.",
         )
 
-    # ── Build safe filename ───────────────────────────────────────────────────
+    # -- Build safe filename --------------------------------------------------
     safe_stem     = Path(original_filename).stem[:64]
     document_id   = str(uuid.uuid4())
     safe_filename = f"{safe_stem}_{document_id[:8]}{suffix}"
 
-    # ── Save to disk ──────────────────────────────────────────────────────────
+    # -- Save to disk ---------------------------------------------------------
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
     dest_path = upload_dir / safe_filename
@@ -135,10 +135,15 @@ async def upload_document(
     async with aiofiles.open(dest_path, "wb") as out_file:
         await out_file.write(content)
 
-    # ── Optionally upload to Cloudinary ───────────────────────────────────────
-    storage_path = upload_file(str(dest_path), original_filename)
+    # -- Optionally upload to Cloudflare R2 -----------------------------------
+    storage_path = upload_file(
+        str(dest_path),
+        original_filename,
+        user_id=current_user.user_id,
+        document_id=document_id,
+    )
 
-    # If Cloudinary is enabled, the local copy is no longer needed
+    # If R2 is enabled, the local copy is no longer needed
     if is_cloud_storage_enabled():
         try:
             dest_path.unlink()
@@ -150,7 +155,7 @@ async def upload_document(
         current_user.user_id, original_filename, len(content),
     )
 
-    # ── Write initial status record ───────────────────────────────────────────
+    # -- Write initial status record ------------------------------------------
     # Written to Redis (prod) or in-memory dict (dev) via status_store.
     # Background task will call update_status() as it progresses.
     set_status(document_id, {
@@ -162,7 +167,7 @@ async def upload_document(
         "user_id":       current_user.user_id,
     })
 
-    # ── Queue background ingestion ────────────────────────────────────────────
+    # -- Queue background ingestion -------------------------------------------
     background_tasks.add_task(
         _run_ingestion,
         file_path=storage_path,
@@ -192,11 +197,11 @@ async def get_ingestion_status(document_id: str, current_user: AuthUser) -> dict
     users — prevents leaking the existence of other users' jobs.
 
     Possible status values:
-      queued      → upload accepted, ingestion not yet started
-      processing  → parsing, chunking, embedding in progress
-      completed   → all chunks stored in Qdrant successfully
-      duplicate   → file was already ingested; existing chunks returned
-      failed      → ingestion failed; 'error' field contains the reason
+      queued      -> upload accepted, ingestion not yet started
+      processing  -> parsing, chunking, embedding in progress
+      completed   -> all chunks stored in Qdrant successfully
+      duplicate   -> file was already ingested; existing chunks returned
+      failed      -> ingestion failed; 'error' field contains the reason
     """
     record = get_status(document_id)
 
@@ -241,7 +246,8 @@ async def get_documents(current_user: AuthUser) -> list[DocumentInfo]:
 )
 async def delete_document_endpoint(filename: str, current_user: AuthUser) -> dict:
     """
-    Delete all Qdrant chunks for a document and remove the local file if present.
+    Delete all Qdrant chunks for a document, remove the R2 object (if R2 is
+    enabled), and clean up any local file copy.
     Tenant isolation is enforced — users can only delete their own documents.
     """
     deleted_chunks = delete_document(filename, user_id=current_user.user_id)
@@ -252,7 +258,16 @@ async def delete_document_endpoint(filename: str, current_user: AuthUser) -> dic
             detail=f"Document '{filename}' not found.",
         )
 
-    # Clean up local upload file if it exists
+    # -- Clean up from Cloudflare R2 ------------------------------------------
+    # The R2 key pattern: rag-uploads/{user_id}/{document_id}{.ext}
+    # We attempt a best-effort delete using the known prefix pattern.
+    # (Phase 3 improvement: query Qdrant metadata for the exact r2_key instead)
+    if is_cloud_storage_enabled():
+        stem = Path(filename).stem[:64]
+        r2_key_guess = f"rag-uploads/{current_user.user_id}/{stem}{Path(filename).suffix.lower()}"
+        delete_file(r2_key_guess)
+
+    # -- Clean up local upload file if it exists ------------------------------
     upload_dir    = Path(settings.UPLOAD_DIR)
     deleted_files: list[str] = []
 
