@@ -12,10 +12,10 @@ class Settings(BaseSettings):
     COLLECTION_NAME: str = "documents"
     GEMINI_MODEL: str = "gemini-2.5-flash"
     EMBEDDING_MODEL: str = "gemini-embedding-001"
-    EMBEDDING_DIM: int = 3072 
+    EMBEDDING_DIM: int = 3072
 
-    # ── Clerk Auth ────────────────────────────────────────────────────────────
-    # Your Clerk Frontend API URL — shown in Clerk Dashboard → API Keys
+    # -- Clerk Auth -----------------------------------------------------------
+    # Your Clerk Frontend API URL -- shown in Clerk Dashboard -> API Keys
     # Dev:  https://<clerk-subdomain>.clerk.accounts.dev
     # Prod: https://clerk.<yourdomain>.com
     CLERK_ISSUER: str
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
             return json.loads(v)
         return [origin.strip() for origin in v.split(",") if origin.strip()]
 
-    # ── Retrieval quality settings ────────────────────────────────────────────
+    # -- Retrieval quality settings -------------------------------------------
 
     # Minimum cosine similarity a chunk must have to be included in context.
     # Chunks below this threshold are silently dropped before the LLM sees them.
@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     ENABLE_HYBRID_SEARCH: bool = True
 
     # Weight blending dense vs sparse scores (Reciprocal Rank Fusion).
-    # Qdrant's RRF handles this automatically — this is the prefetch limit
+    # Qdrant's RRF handles this automatically -- this is the prefetch limit
     # for each sub-query (dense + sparse) before fusion.
     HYBRID_PREFETCH_LIMIT: int = 20
 
@@ -67,34 +67,39 @@ class Settings(BaseSettings):
     QDRANT_URL: str | None = None
     QDRANT_API_KEY: str | None = None
 
-    # ── Upstash Redis (leave unset for local dev) ─────────────────────────────
+    # -- Upstash Redis (leave unset for local dev) -----------------------------
     # Used to store document ingestion job status across restarts and workers.
     # Falls back to an in-memory dict when these are not set (local dev only).
     #
     # Get these from: https://console.upstash.com
     #   1. Create a Redis database
-    #   2. Copy "REST URL" → UPSTASH_REDIS_REST_URL
-    #   3. Copy "REST Token" → UPSTASH_REDIS_REST_TOKEN
+    #   2. Copy "REST URL" -> UPSTASH_REDIS_REST_URL
+    #   3. Copy "REST Token" -> UPSTASH_REDIS_REST_TOKEN
     UPSTASH_REDIS_REST_URL:   str | None = None
     UPSTASH_REDIS_REST_TOKEN: str | None = None
 
-    # Cloudinary (leave unset for local dev)
-    CLOUDINARY_CLOUD_NAME: str | None = None
-    CLOUDINARY_API_KEY: str | None = None
-    CLOUDINARY_API_SECRET: str | None = None
+    # -- Cloudflare R2 (leave unset for local dev) ----------------------------
+    # Get credentials: dash.cloudflare.com -> R2 -> Manage R2 API Tokens
+    R2_ACCOUNT_ID:        str | None = None
+    R2_ACCESS_KEY_ID:     str | None = None
+    R2_SECRET_ACCESS_KEY: str | None = None
+    R2_BUCKET_NAME:       str        = "papermind-uploads"
+    R2_ENDPOINT_URL:      str | None = None  # https://{account_id}.r2.cloudflarestorage.com
 
-    # @property
-    # def use_cloudinary(self) -> bool:
-    #     return bool(
-    #         self.CLOUDINARY_CLOUD_NAME
-    #         and self.CLOUDINARY_API_KEY
-    #         and self.CLOUDINARY_API_SECRET
-    #     )
+    @property
+    def use_r2(self) -> bool:
+        """True when Cloudflare R2 credentials are fully configured."""
+        return bool(
+            self.R2_ACCOUNT_ID
+            and self.R2_ACCESS_KEY_ID
+            and self.R2_SECRET_ACCESS_KEY
+            and self.R2_ENDPOINT_URL
+        )
 
     @property
     def use_qdrant_cloud(self) -> bool:
         return bool(self.QDRANT_URL and self.QDRANT_API_KEY)
-    
+
     @property
     def use_redis(self) -> bool:
         """True when Upstash Redis credentials are configured."""
