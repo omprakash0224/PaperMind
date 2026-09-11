@@ -1,0 +1,29 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local data dirs (mounted as volumes in compose)
+uploads/
+qdrant_data/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Tests
+testing/
+
+# Editor / OS
+.git/
+.gitignore
+*.log
+.DS_Store
+Thumbs.db

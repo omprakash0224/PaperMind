@@ -63,14 +63,29 @@ async def lifespan(app: FastAPI):
         ensure_collection()
         count  = client.count(collection_name=settings.COLLECTION_NAME, exact=True).count
         logger.info(
-            "Qdrant ready — collection '%s' contains %d chunks.",
+            "Qdrant ready -- collection '%s' contains %d chunks.",
             settings.COLLECTION_NAME, count,
         )
     except Exception as exc:
         logger.warning("Qdrant warm-up failed (will retry on first request): %s", exc)
 
+    # Initialise ARQ Redis pool (job queue)
+    try:
+        from app.services.queue import get_arq_pool
+        await get_arq_pool()
+        logger.info("ARQ Redis pool ready: %s", settings.REDIS_URL)
+    except Exception as exc:
+        logger.warning("ARQ Redis pool init failed (will retry on first request): %s", exc)
+
     logger.info("API startup complete.")
     yield
+
+    # Close ARQ Redis pool on shutdown
+    from app.services.queue import _arq_pool
+    if _arq_pool:
+        await _arq_pool.aclose()
+        logger.info("ARQ Redis pool closed.")
+
     logger.info("Shutting down RAG Document Q&A API.")
 
 
@@ -105,7 +120,7 @@ async def health_check() -> dict:
         "status":   "ok",
         "version":  "2.0.0",
         "auth":     "clerk",
-        "services": {"qdrant": "unknown"},
+        "services": {"qdrant": "unknown", "arq_redis": "unknown"},
         "stats":    {"total_chunks": 0},
     }
     try:
@@ -115,7 +130,18 @@ async def health_check() -> dict:
         health["services"]["qdrant"]    = "ok"
         health["stats"]["total_chunks"] = count
     except Exception as exc:
-        logger.error("Health check — Qdrant unreachable: %s", exc)
+        logger.error("Health check -- Qdrant unreachable: %s", exc)
         health["status"]             = "degraded"
         health["services"]["qdrant"] = f"error: {exc}"
+
+    try:
+        from app.services.queue import get_arq_pool
+        pool = await get_arq_pool()
+        await pool.ping()
+        health["services"]["arq_redis"] = "ok"
+    except Exception as exc:
+        logger.warning("Health check -- ARQ Redis unreachable: %s", exc)
+        health["status"]                 = "degraded"
+        health["services"]["arq_redis"] = f"error: {exc}"
+
     return health
