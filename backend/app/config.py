@@ -86,6 +86,15 @@ class Settings(BaseSettings):
     R2_BUCKET_NAME:       str        = "papermind-uploads"
     R2_ENDPOINT_URL:      str | None = None  # https://{account_id}.r2.cloudflarestorage.com
 
+    # -- ARQ / Redis (TCP connection for job queue) ----------------------------
+    # Standard Redis TCP URL -- NOT the Upstash REST URL above.
+    # Local dev:   redis://localhost:6379
+    # Production:  rediss://default:<password>@<host>.upstash.io:6380  (TLS)
+    REDIS_URL:       str = "redis://localhost:6379"
+    ARQ_MAX_JOBS:    int = 2    # max concurrent jobs per worker process
+    ARQ_JOB_TIMEOUT: int = 600  # seconds before a job is killed (10 min)
+    ARQ_MAX_TRIES:   int = 5    # retry attempts before marking as failed
+
     @property
     def use_r2(self) -> bool:
         """True when Cloudflare R2 credentials are fully configured."""

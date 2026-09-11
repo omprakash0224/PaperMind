@@ -1,0 +1,112 @@
+# PaperMind — full-stack Docker Compose
+#
+# Services:
+#   redis      — ARQ job queue (standard TCP Redis)
+#   fastapi    — FastAPI backend (uvicorn)
+#   arq-worker — ARQ ingestion worker (same image as fastapi)
+#   frontend   — Next.js frontend (standalone build)
+#
+# Usage:
+#   # Development (with live reload)
+#   docker compose up
+#
+#   # Production build
+#   docker compose -f docker-compose.yml up --build -d
+#
+#   # Scale ARQ workers horizontally
+#   docker compose up --scale arq-worker=3
+#
+# Before starting:
+#   - Copy backend/.env.example  -> backend/.env  and fill in secrets
+#   - Copy frontend/.env.example -> frontend/.env and fill in secrets
+#   - Set NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY as a build arg or in frontend/.env
+
+version: "3.9"
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  fastapi:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: ./backend/.env
+    environment:
+      # Override REDIS_URL so FastAPI talks to the compose redis service
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      # Persist uploads and local Qdrant data outside the container
+      - uploads_data:/app/uploads
+      - qdrant_data:/app/qdrant_data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── ARQ ingestion worker ────────────────────────────────────────────────────
+  # Shares the same image as fastapi — no separate Dockerfile needed.
+  # Scale horizontally: docker compose up --scale arq-worker=3
+  arq-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - uploads_data:/app/uploads
+      - qdrant_data:/app/qdrant_data
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: arq app.worker.WorkerSettings
+
+  # ── Next.js frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the Next.js bundle at build time.
+        # NEXT_PUBLIC_* vars must be known at build time, not just runtime.
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: ./frontend/.env
+    environment:
+      # Runtime-only secrets (not baked into the bundle)
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+      - NODE_ENV=production
+    depends_on:
+      fastapi:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  uploads_data:
+  qdrant_data:

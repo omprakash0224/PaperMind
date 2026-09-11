@@ -1,5 +1,5 @@
 """
-Upload API — protected by Clerk JWT via the AuthUser dependency.
+Upload API -- protected by Clerk JWT via the AuthUser dependency.
 
 user_id is Clerk's userId string (e.g. "user_2NkXyz..."),
 stamped into every Qdrant chunk for tenant isolation.
@@ -7,6 +7,10 @@ stamped into every Qdrant chunk for tenant isolation.
 Ingestion status is persisted via status_store (Upstash Redis in production,
 in-memory dict in local dev) so job state survives server restarts and
 works correctly with multiple workers.
+
+Jobs are enqueued to ARQ (Redis-backed async queue) and picked up by
+a separate `arq app.worker.WorkerSettings` worker process. This keeps
+the web server event loop fully unblocked during long ingestion tasks.
 """
 
 import logging
@@ -14,15 +18,15 @@ import uuid
 from pathlib import Path
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, HTTPException, UploadFile, File, status
 
 from app.config import get_settings
 from app.dependencies import AuthUser
 from app.models.schemas import DocumentInfo, UploadResponse
-from app.services.ingestion import ingest_document
 from app.services.vectorstore import delete_document, list_documents
 from app.services.storage import upload_file, is_cloud_storage_enabled, delete_file
-from app.services.status_store import set_status, get_status, update_status
+from app.services.status_store import set_status, get_status
+from app.services.queue import enqueue_ingestion_job
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
@@ -34,51 +38,6 @@ MAX_FILE_SIZE_MB    = 50
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 
-def _run_ingestion(
-    file_path:   str,
-    filename:    str,
-    document_id: str,
-    user_id:     str,
-) -> None:
-    """
-    Background task: parse, chunk, embed, and store a document.
-
-    Writes status updates to the status store at each stage so the frontend
-    polling /status/{document_id} sees live progress.
-
-    Stages:
-      queued      -> set at upload time (before this function is called)
-      processing  -> set immediately when this function starts
-      completed   -> set on success (includes chunks_count)
-      duplicate   -> set when deduplication detects a previously ingested file
-      failed      -> set on any exception (includes error message)
-    """
-    update_status(document_id, {"status": "processing"})
-
-    try:
-        result = ingest_document(file_path, filename, user_id=user_id)
-
-        update_status(document_id, {
-            "status":       result["status"],       # "completed" or "duplicate"
-            "chunks_count": result["chunks_count"],
-            "document_id":  result["document_id"],
-        })
-
-        logger.info(
-            "Ingestion done | user_id=%s | file='%s' | status=%s",
-            user_id, filename, result["status"],
-        )
-
-    except Exception as exc:
-        logger.exception(
-            "Ingestion failed | user_id=%s | file='%s': %s", user_id, filename, exc
-        )
-        update_status(document_id, {
-            "status": "failed",
-            "error":  str(exc),
-        })
-
-
 @router.post(
     "/upload",
     response_model=UploadResponse,
@@ -86,13 +45,12 @@ def _run_ingestion(
     summary="Upload a PDF or DOCX document for ingestion",
 )
 async def upload_document(
-    background_tasks: BackgroundTasks,
-    current_user:     AuthUser,
+    current_user: AuthUser,
     file: UploadFile = File(..., description="PDF or DOCX file (max 50 MB)"),
 ) -> UploadResponse:
     """
-    Accept a file upload, save it to disk (or Cloudflare R2), queue ingestion,
-    and return immediately with HTTP 202. The client should poll
+    Accept a file upload, save it to disk (or Cloudflare R2), queue ingestion
+    via ARQ, and return immediately with HTTP 202. The client should poll
     GET /api/documents/status/{document_id} to track progress.
     """
     original_filename = file.filename or "upload"
@@ -157,7 +115,7 @@ async def upload_document(
 
     # -- Write initial status record ------------------------------------------
     # Written to Redis (prod) or in-memory dict (dev) via status_store.
-    # Background task will call update_status() as it progresses.
+    # ARQ worker will call update_status() as it progresses.
     set_status(document_id, {
         "document_id":   document_id,
         "filename":      original_filename,
@@ -167,14 +125,14 @@ async def upload_document(
         "user_id":       current_user.user_id,
     })
 
-    # -- Queue background ingestion -------------------------------------------
-    background_tasks.add_task(
-        _run_ingestion,
+    # -- Enqueue ingestion job via ARQ ----------------------------------------
+    job_id = await enqueue_ingestion_job(
+        document_id=document_id,
         file_path=storage_path,
         filename=original_filename,
-        document_id=document_id,
         user_id=current_user.user_id,
     )
+    logger.info("ARQ ingestion job enqueued | job_id=%s | document_id=%s", job_id, document_id)
 
     return UploadResponse(
         document_id=document_id,
@@ -194,7 +152,7 @@ async def get_ingestion_status(document_id: str, current_user: AuthUser) -> dict
 
     Reads from Redis (prod) or in-memory dict (dev) via status_store.
     Returns 404 for both missing records and records belonging to other
-    users — prevents leaking the existence of other users' jobs.
+    users -- prevents leaking the existence of other users' jobs.
 
     Possible status values:
       queued      -> upload accepted, ingestion not yet started
@@ -224,7 +182,7 @@ async def get_ingestion_status(document_id: str, current_user: AuthUser) -> dict
 async def get_documents(current_user: AuthUser) -> list[DocumentInfo]:
     """
     Return all documents ingested by the current user.
-    Reads from Qdrant — not from the status store.
+    Reads from Qdrant -- not from the status store.
     The status store only tracks in-flight jobs; Qdrant is the source of truth
     for completed ingestions.
     """
@@ -248,7 +206,7 @@ async def delete_document_endpoint(filename: str, current_user: AuthUser) -> dic
     """
     Delete all Qdrant chunks for a document, remove the R2 object (if R2 is
     enabled), and clean up any local file copy.
-    Tenant isolation is enforced — users can only delete their own documents.
+    Tenant isolation is enforced -- users can only delete their own documents.
     """
     deleted_chunks = delete_document(filename, user_id=current_user.user_id)
 
