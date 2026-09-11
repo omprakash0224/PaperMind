@@ -8,12 +8,13 @@
    - [Entry Point & Startup](#entry-point--startup)
    - [Authentication](#authentication)
    - [API Layer](#api-layer)
+   - [Asynchronous Task Queue & Workers (ARQ)](#asynchronous-task-queue--workers-arq)
    - [Ingestion Pipeline](#ingestion-pipeline)
    - [RAG Query Pipeline](#rag-query-pipeline)
    - [Vector Store](#vector-store)
    - [BM25 Sparse Encoder](#bm25-sparse-encoder)
-   - [Storage Abstraction](#storage-abstraction)
-   - [Status Store](#status-store)
+   - [Storage Abstraction (Cloudflare R2)](#storage-abstraction-cloudflare-r2)
+   - [Dual Redis Roles: Status Store vs Task Queue](#dual-redis-roles-status-store-vs-task-queue)
    - [Document Parsers](#document-parsers)
    - [Configuration](#configuration)
 4. [Frontend](#frontend)
@@ -25,37 +26,69 @@
    - [Upload & Ingestion Flow](#upload--ingestion-flow)
    - [Query Flow](#query-flow)
 6. [Tenant Isolation](#tenant-isolation)
-7. [Dev vs Production Backends](#dev-vs-production-backends)
-8. [Environment Variables](#environment-variables)
+7. [Containerization & Deployment](#containerization--deployment)
+8. [Dev vs Production Backends](#dev-vs-production-backends)
+9. [Environment Variables](#environment-variables)
 
 ---
 
 ## System Overview
 
+```mermaid
+flowchart TD
+    subgraph Client["Client Tier"]
+        FE["Next.js 16 Frontend<br/>(React 19 · Tailwind CSS v4)"]
+        CLERK["Clerk Auth Provider"]
+        FE -. Authenticates .-> CLERK
+    end
+
+    subgraph API_Tier["Web API Tier"]
+        API["FastAPI Backend<br/>(uvicorn)"]
+    end
+
+    subgraph State_Storage["Storage & Message Brokers"]
+        R2[("Cloudflare R2<br/>Object Storage (boto3)")]
+        ARQ_REDIS[("Redis (TCP)<br/>ARQ Task Queue")]
+        STATUS_REDIS[("Upstash Redis (REST)<br/>Job Status Store")]
+    end
+
+    subgraph Worker_Tier["Asynchronous Worker Tier"]
+        WORKER["ARQ Ingestion Worker<br/>(app.worker.WorkerSettings)"]
+    end
+
+    subgraph AI_Tier["AI & Vector Search Tier"]
+        GEMINI["Google Gemini API<br/>(gemini-2.5-flash & gemini-embedding-001)"]
+        QDRANT[("Qdrant Vector Database<br/>(Dense + Sparse Collections)")]
+    end
+
+    FE -->|"HTTPS + Bearer JWT"| API
+    FE -->|"Polls /api/documents/status/{id}"| API
+    API -->|"Upload file object"| R2
+    API -->|"Enqueue ingestion job"| ARQ_REDIS
+    API -->|"Record initial status ('queued')"| STATUS_REDIS
+    API -->|"Read status"| STATUS_REDIS
+
+    ARQ_REDIS -->|"Pop job"| WORKER
+    WORKER -->|"Update status ('processing' / 'completed')"| STATUS_REDIS
+    WORKER -->|"Download file via pre-signed URL"| R2
+    WORKER -->|"Generate dense embeddings"| GEMINI
+    WORKER -->|"Upsert dense + sparse vectors (with user_id)"| QDRANT
+
+    API -->|"Query rewriting & LLM synthesis"| GEMINI
+    API -->|"Hybrid retrieval (Dense + Sparse RRF)"| QDRANT
 ```
-┌────────────────────────────────────────────────────────┐
-│                  Next.js Frontend                      │
-│  FileUpload · DocumentList · ChatWindow · SourceCard   │
-│              Clerk (Auth) · lib/api.ts                 │
-└────────────────────┬───────────────────────────────────┘
-                     │  HTTPS + Bearer JWT
-┌────────────────────▼───────────────────────────────────┐
-│                 FastAPI Backend                        │
-│  /api/documents/* (upload, status, list, delete)       │
-│  /api/query       (RAG question answering)             │
-│  /health                                               │
-│                                                        │
-│  Auth: Clerk RS256 JWT ◄── JWKS cached 1 hr            │
-└───┬───────────────┬───────────────────┬────────────────┘
-    │               │                   │
-    ▼               ▼                   ▼
- Qdrant        Upstash Redis       Cloudinary
- (vectors)     (job status)        (file storage)
-    │
-    ▼
- Google Gemini API
- (embeddings + LLM)
-```
+
+The system is organized into four distinct tiers:
+
+1. **Client Tier (Next.js 16)** — Interactive single-page application utilizing React 19, Tailwind CSS v4, Clerk authentication, drag-and-drop file ingestion with status polling, and a conversational chat UI with Markdown and source citation cards.
+2. **Web API Tier (FastAPI)** — Lightweight, stateless REST API. Validates requests, verifies Clerk JWT tokens, receives file uploads, stores raw files in Cloudflare R2 (or local disk in dev), registers initial job records in the status store, enqueues ingestion jobs into Redis, and answers RAG queries. Long-running document ingestion is strictly decoupled from the web server.
+3. **Worker Tier (ARQ Ingestion Worker)** — Dedicated, stateless Python worker (`app.worker.WorkerSettings`) communicating via standard TCP Redis. Pops ingestion jobs, generates time-limited pre-signed URLs to download source files from Cloudflare R2, parses and chunks documents, generates Gemini dense and BM25 sparse embeddings, upserts vectors to Qdrant, and updates the status store.
+4. **Data & Storage Tier**:
+   - **Cloudflare R2**: S3-compatible, private cloud object storage for raw PDFs/DOCXs with zero egress fees.
+   - **Qdrant**: Vector database housing unified dense + sparse collections with server-side Reciprocal Rank Fusion (RRF) and mandatory tenant filtering.
+   - **Redis (TCP)**: Reliable broker and state store for the ARQ asynchronous job queue.
+   - **Upstash Redis (REST)**: Serverless, HTTP-accessible key-value store for polling ingestion statuses across distributed instances.
+   - **Google Gemini**: Dual-purpose LLM provider used for both dense embeddings (`gemini-embedding-001`) and conversational generation (`gemini-2.5-flash`).
 
 ---
 
@@ -66,38 +99,55 @@
 ├── backend/
 │   ├── app/
 │   │   ├── api/
-│   │   │   ├── query.py          # POST /api/query
-│   │   │   └── upload.py         # /api/documents/* endpoints
+│   │   │   ├── query.py          # POST /api/query (RAG Q&A)
+│   │   │   └── upload.py         # /api/documents/* (upload, status, list, delete)
 │   │   ├── models/
-│   │   │   └── schemas.py        # Pydantic request/response models
+│   │   │   └── schemas.py        # Pydantic request and response schemas
 │   │   ├── services/
-│   │   │   ├── bm25.py           # Pure-Python BM25 sparse encoder
-│   │   │   ├── ingestion.py      # Document ingestion pipeline
-│   │   │   ├── rag_chain.py      # RAG query pipeline
-│   │   │   ├── status_store.py   # Redis / in-memory job status
-│   │   │   ├── storage.py        # Cloudinary / local file storage
-│   │   │   └── vectorstore.py    # Qdrant client & collection helpers
+│   │   │   ├── bm25.py           # Pure-Python BM25 sparse vector encoder
+│   │   │   ├── ingestion.py      # Document ingestion, deduplication & embedding
+│   │   │   ├── queue.py          # ARQ Redis connection pool & job enqueueing
+│   │   │   ├── rag_chain.py      # RAG query pipeline (rewriter, RRF search, LLM)
+│   │   │   ├── status_store.py   # Ingestion status tracking (Upstash Redis / in-memory)
+│   │   │   ├── storage.py        # Cloudflare R2 / local file storage abstraction
+│   │   │   └── vectorstore.py    # Qdrant client, collection setup & tenant filters
 │   │   ├── utils/
-│   │   │   └── parsers.py        # PDF (PyMuPDF) & DOCX parsers
-│   │   ├── config.py             # Pydantic settings (lru_cache)
-│   │   ├── dependencies.py       # Clerk JWT FastAPI dependency
-│   │   └── main.py               # App factory, lifespan, CORS
-│   └── .env.example
+│   │   │   └── parsers.py        # PDF (PyMuPDF) and DOCX parsers with boilerplate stripping
+│   │   ├── config.py             # Pydantic settings with cached loader
+│   │   ├── dependencies.py       # Clerk JWT verification dependency (JWKS cached)
+│   │   ├── main.py               # FastAPI application, lifespan manager, CORS, /health
+│   │   └── worker.py             # ARQ worker definition, job functions & lifecycle hooks
+│   ├── .dockerignore
+│   ├── .env.example
+│   ├── Dockerfile                # Multi-stage container for both FastAPI and ARQ worker
+│   └── requirements.txt
 │
-└── frontend/
-    ├── app/
-    │   ├── globals.css
-    │   ├── layout.tsx            # ClerkProvider root
-    │   └── page.tsx              # Main app page
-    ├── components/
-    │   ├── ChatWindow.tsx        # Message input & conversation
-    │   ├── DocumentList.tsx      # Sidebar document browser
-    │   ├── FileUpload.tsx        # Drag-and-drop uploader + poller
-    │   ├── MessageBubble.tsx     # Markdown-rendered messages
-    │   └── SourceCard.tsx        # Relevance-scored source chunk cards
-    ├── lib/
-    │   └── api.ts                # Typed fetch wrapper + all API calls
-    └── middleware.ts             # Clerk Edge middleware (route protection)
+├── frontend/
+│   ├── app/
+│   │   ├── globals.css           # Tailwind CSS v4 styling
+│   │   ├── layout.tsx            # ClerkProvider root layout
+│   │   └── page.tsx              # Main dashboard and chat interface
+│   ├── components/
+│   │   ├── ChatWindow.tsx        # Message history & input prompt
+│   │   ├── DocumentList.tsx      # Sidebar listing user's documents & delete flow
+│   │   ├── FileUpload.tsx        # Drag-and-drop dropzone with status polling
+│   │   ├── MessageBubble.tsx     # Markdown renderer for assistant responses
+│   │   └── SourceCard.tsx        # Relevance-graded source attribution cards
+│   ├── lib/
+│   │   └── api.ts                # Authenticated fetch client & polling utilities
+│   ├── middleware.ts             # Clerk Edge route protection middleware
+│   ├── .dockerignore
+│   ├── .env.example
+│   ├── Dockerfile                # 3-stage standalone Next.js container
+│   ├── next.config.ts            # Next.js configuration (output: "standalone")
+│   └── package.json
+│
+├── docs/
+│   └── ARCHITECTURE.MD           # This architectural specification
+├── extras/
+│   └── MIGRATION.md              # Historical migration guide (R2 & ARQ)
+├── .env.example                  # Root environment variables for Docker Compose
+└── docker-compose.yml            # Complete stack orchestration (redis, fastapi, worker, frontend)
 ```
 
 ---
@@ -108,13 +158,20 @@
 
 **`app/main.py`**
 
-FastAPI app is created with a `lifespan` context manager that runs on startup:
+The FastAPI application initializes through an asynchronous `lifespan` context manager:
 
-1. Creates upload and Qdrant persist directories.
-2. Pre-fetches Clerk JWKS so the first request is not penalised by a network round-trip.
-3. Warms up Qdrant by ensuring the collection exists and logging the chunk count.
+1. **Directories**: Ensures local fallback upload directories (`./uploads/`) and local Qdrant data directories (`./qdrant_data/`) exist.
+2. **Clerk JWKS**: Pre-fetches Clerk's JSON Web Key Set so initial incoming requests do not incur an outbound HTTP latency penalty.
+3. **Qdrant Collection**: Invokes `ensure_collection()` to verify or construct the multi-vector schema (dense + sparse) and logs the active vector count.
+4. **ARQ Redis Pool**: Initializes the global `ArqRedis` connection pool via `get_arq_pool()` so job enqueueing is immediate and non-blocking on incoming uploads.
+5. **Shutdown Hook**: Gracefully closes the ARQ Redis connection pool on application termination.
 
-CORS is configured from the `CORS_ORIGINS` setting (comma-separated string in env, parsed into a list).
+#### `/health` Endpoint
+
+Exposes an asynchronous health probe:
+- **`services.qdrant`**: Validates connection and reports total indexed chunks.
+- **`services.arq_redis`**: Sends a `PING` over the ARQ Redis connection to verify task broker availability.
+- Marks status as `degraded` if any dependency fails.
 
 ---
 
@@ -122,27 +179,36 @@ CORS is configured from the `CORS_ORIGINS` setting (comma-separated string in en
 
 **`app/dependencies.py`**
 
-Clerk issues RS256 JWTs. The backend verifies them without a database, using Clerk's public JWKS endpoint.
+Authentication is completely stateless, relying on Clerk's RS256 JWTs verified against Clerk's public JWKS endpoint. No user database is maintained in PaperMind.
 
-**Verification flow:**
+#### JWT Verification Flow
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as User Browser
+    participant Clerk as Clerk Service
+    participant API as FastAPI (dependencies.py)
+    participant Cache as Memory JWKS Cache
+    participant JWKS as Clerk JWKS Endpoint
+
+    Client->>Clerk: Authenticate User
+    Clerk-->>Client: Issue RS256 JWT Token
+    Client->>API: HTTP Request (Authorization: Bearer <token>)
+    API->>API: Decode JWT header to extract key ID (kid)
+    API->>Cache: Lookup public key for kid
+    alt Key found in cache (TTL 1 hour)
+        Cache-->>API: Return public RSA key
+    else Key not cached / Key rotation
+        API->>JWKS: Fetch latest JWKS keys
+        JWKS-->>API: Return public keys & update cache
+    end
+    API->>API: Verify RS256 signature, expiry & issuer claim
+    API->>API: Extract sub claim -> user_id
+    API-->>Client: Process authorized request (AuthUser)
 ```
-1. Extract Bearer token from Authorization header
-2. Decode JWT header → get key ID (kid)
-3. Find matching key in JWKS cache (TTL = 1 hour)
-   └── If kid not found: bust cache, re-fetch once (handles key rotation)
-4. Verify RS256 signature + expiry via python-jose
-5. Validate iss == CLERK_ISSUER
-6. Extract sub → user_id
-```
 
-**`AuthUser`** is a `typing.Annotated` alias used as a FastAPI dependency in every protected route:
-
-```python
-AuthUser = Annotated[CurrentUser, Depends(get_current_user)]
-```
-
-The `CurrentUser` dataclass carries `user_id`, `email`, and `username`. The `user_id` (Clerk's `sub` claim) is the tenant isolation key written into every Qdrant point.
+The `AuthUser` dependency (`Annotated[CurrentUser, Depends(get_current_user)]`) injects the authenticated `CurrentUser(user_id, email, username)` into API endpoints. The `user_id` acts as the tenant isolation key across vector records, object storage, and status keys.
 
 ---
 
@@ -150,30 +216,85 @@ The `CurrentUser` dataclass carries `user_id`, `email`, and `username`. The `use
 
 #### `POST /api/documents/upload`
 
-1. Validates file type (`.pdf`, `.docx`) and size (max 50 MB).
-2. Saves the file to disk with a UUID-prefixed safe filename.
-3. Optionally uploads to Cloudinary if credentials are set.
-4. Writes an initial `queued` status record to the status store.
-5. Returns HTTP **202** immediately with a `document_id`.
-6. Queues a background task (`_run_ingestion`) via FastAPI's `BackgroundTasks`.
+- Validates file extensions (`.pdf`, `.docx`) and enforces the 50 MB size limit.
+- Streams the upload to disk under a UUID-prefixed safe filename.
+- Uploads the file to **Cloudflare R2** under `rag-uploads/{user_id}/{document_id}{.ext}` when configured (or retains the local path in dev).
+- Records an initial `queued` entry in the status store.
+- Calls `await enqueue_ingestion_job(...)` to push the job to the Redis ARQ queue.
+- Immediately returns HTTP **202 Accepted** with `{ "document_id": "...", "filename": "...", "status": "queued" }`.
+- **Note**: The web server never performs document parsing or embeddings inline; the request returns in under 50ms.
 
 #### `GET /api/documents/status/{document_id}`
 
-Polls the status store. Returns 404 for both missing records and records belonging to a different user (prevents user enumeration).
-
-Status values: `queued` → `processing` → `completed` | `duplicate` | `failed`
+- Reads the current ingestion state from the status store (`status_store.py`).
+- Returns HTTP 404 if the record does not exist or if `record["user_id"] != current_user.user_id` to prevent cross-tenant enumeration.
+- Status values: `queued` → `processing` → `completed` | `duplicate` | `failed`.
 
 #### `GET /api/documents`
 
-Lists all documents for the current user by scrolling Qdrant (not the status store). Qdrant is the source of truth for completed ingestions; the status store only tracks in-flight jobs.
+- Retrieves all distinct ingested documents for the authenticated user by scrolling Qdrant points filtered by `metadata.user_id`.
+- Qdrant is the authoritative source of truth for ingested documents.
 
 #### `DELETE /api/documents/{filename}`
 
-Deletes all Qdrant chunks matching `filename + user_id`, then removes local upload files if present. Returns 404 if no chunks found.
+- Deletes all points in Qdrant matching `metadata.user_id == current_user.user_id` and `metadata.source == filename`.
+- Calls `delete_file()` in `storage.py` to remove the corresponding asset from Cloudflare R2.
+- Deletes the local file from `./uploads/` if present.
+- Returns HTTP 404 if no matching documents were found.
 
 #### `POST /api/query`
 
-Passes the question, optional document filter, and `user_id` to the RAG pipeline. Returns the answer and source chunks.
+- Receives a user question and an optional `document_id` / `filename` filter.
+- Executes the RAG query pipeline and returns the synthesized answer along with confidence-scored source citations.
+
+---
+
+### Asynchronous Task Queue & Workers (ARQ)
+
+**`app/services/queue.py` & `app/worker.py`**
+
+In earlier iterations, background processing used FastAPI's in-process `BackgroundTasks`. Under production workloads, free-tier Gemini rate limits require 12-second batch sleeps during embeddings. Under `BackgroundTasks`, this starved the FastAPI event loop, blocked concurrent requests, lost tasks on server restart, and prevented multi-worker scaling.
+
+PaperMind now utilizes **ARQ (Async Redis Queue)**, a lightweight, pure-Python asynchronous job queue built on standard Redis:
+
+```mermaid
+flowchart LR
+    subgraph Producer["FastAPI Web Server (Producer)"]
+        direction TB
+        REQ["POST /api/documents/upload"] --> STORE["Save file to R2 / local disk"]
+        STORE --> ENQUEUE["enqueue_ingestion_job()"]
+        ENQUEUE --> RESP["Return HTTP 202 Accepted<br/>(Immediate response)"]
+    end
+
+    subgraph Broker["Redis Broker (Standard TCP)"]
+        QUEUE[("arq:queue:ingestion<br/>Job payload: document_id, file_path, user_id")]
+    end
+
+    subgraph Consumer["ARQ Worker Process (Consumer)"]
+        direction TB
+        POP["Pops job from Redis"] --> DL["Download from R2 via pre-signed URL"]
+        DL --> INGEST["ingest_document()<br/>Parse · Chunk · Embed · Upsert"]
+        INGEST --> STATUS["update_status('completed')"]
+    end
+
+    ENQUEUE -->|"Async enqueue"| QUEUE
+    QUEUE -->|"Worker poll & lock"| POP
+```
+
+#### Key Architecture Principles of ARQ in PaperMind
+
+1. **Pure Python Architecture**: Zero Node.js or BullMQ dependencies. The worker directly executes the Python ingestion pipeline.
+2. **Process Isolation**: Ingestion workloads run in a separate OS process (`arq app.worker.WorkerSettings`), leaving the web server event loop completely unblocked.
+3. **Durability & Retries**: Jobs are persisted in Redis. If a worker terminates or encounters transient network failures, ARQ automatically retries the job up to `ARQ_MAX_TRIES=5` times with exponential backoff.
+4. **Timeouts**: Configured with `ARQ_JOB_TIMEOUT=600` (10 minutes) to prevent rogue or malformed documents from locking workers indefinitely.
+5. **Horizontal Scaling**: Because workers read from a shared Redis queue, additional workers can be spun up across containers without code changes (`docker compose up --scale arq-worker=3`).
+
+#### Implementation Details
+
+- **`get_arq_pool()`**: Returns a shared singleton `ArqRedis` connection pool created via `RedisSettings.from_dsn(settings.REDIS_URL)`.
+- **`enqueue_ingestion_job()`**: Enqueues the job function `"run_ingestion"` with keyword arguments `document_id`, `file_path`, `filename`, and `user_id`.
+- **`run_ingestion(ctx, ...)`**: The worker execution entry point. Updates status to `processing`, runs `ingest_document()`, records `completed` status with chunk statistics, or records `failed` status and re-raises on unhandled exceptions to trigger ARQ retry logic.
+- **Worker Lifecycle**: Implements `startup` to pre-warm the Qdrant collection and `shutdown` for graceful worker termination.
 
 ---
 
@@ -181,28 +302,30 @@ Passes the question, optional document filter, and `user_id` to the RAG pipeline
 
 **`app/services/ingestion.py`**
 
-```
-ingest_document(file_path, filename, user_id)
-  │
-  ├─ 0. download_for_processing()   — fetch from Cloudinary to temp file if needed
-  ├─ 1. _compute_file_hash()        — SHA-256 for deduplication
-  ├─ 2. _doc_hash_exists()          — Qdrant scroll filtered by (file_hash, user_id)
-  │      └─ return early if duplicate
-  ├─ 3. parse_document()            — PDF or DOCX → list of {text, metadata} per page
-  ├─ 4. RecursiveCharacterTextSplitter
-  │      chunk_size=500 tokens (tiktoken cl100k_base), overlap=50
-  │      separators: ["\n\n", "\n", ". ", " "]
-  │      Each chunk gets metadata: source, page, chunk_index, document_id,
-  │                                file_hash, user_id
-  └─ 5. _upsert_batch_with_retry()  — batches of 5 chunks
-         ├─ embed_documents()       — Google Gemini (task_type=RETRIEVAL_DOCUMENT)
-         ├─ passage_embed()         — BM25 TF sparse vectors
-         └─ client.upsert()         — PointStruct with both dense + sparse vectors
+```mermaid
+flowchart TD
+    START(["Start: ingest_document(file_path, filename, user_id)"]) --> STEP0["0. download_for_processing()<br/>Fetch from R2 via pre-signed URL to tempfile"]
+    STEP0 --> STEP1["1. _compute_file_hash()<br/>Calculate SHA-256 hash"]
+    STEP1 --> STEP2{"2. _doc_hash_exists()?<br/>Check Qdrant for (file_hash, user_id)"}
+    STEP2 -- "Yes (Duplicate)" --> DUP["Return early: {'status': 'duplicate'}"]
+    STEP2 -- "No (New Doc)" --> STEP3["3. parse_document()<br/>PyMuPDF (PDF) or python-docx (DOCX)<br/>Strip repeated headers & footers"]
+    STEP3 --> STEP4["4. RecursiveCharacterTextSplitter<br/>500 tokens, 50 overlap (tiktoken cl100k_base)<br/>Inject user_id, document_id, file_hash metadata"]
+    STEP4 --> STEP5["5. Batch Processing (5 chunks per batch)"]
+
+    subgraph BatchLoop["Batch Processing Loop (Rate-Limit Safe)"]
+        direction TB
+        B1["Embed dense vectors<br/>(Gemini gemini-embedding-001)"] --> B2["Compute sparse vectors<br/>(Pure-Python BM25)"]
+        B2 --> B3["client.upsert()<br/>PointStruct with dense + sparse vectors"]
+        B3 --> B4{"Remaining chunks?"}
+        B4 -- "Yes" --> DELAY["12-second delay<br/>(Gemini RPM compliance)"] --> B1
+        B4 -- "No" --> FINISH(["Ingestion Complete<br/>Status: 'completed'"])
+    end
+
+    STEP5 --> B1
 ```
 
-**Rate limiting:** Free-tier Gemini embedding API allows 5 RPM. Batches of 5 chunks with 12-second delays between batches. Exponential backoff (15s base, doubles) on 429 errors, up to 5 retries.
-
-**Deduplication:** Scoped per `user_id`. Two different users uploading the same file will each get their own copy (correct multi-tenant behaviour).
+- **Per-User Deduplication**: Computes SHA-256 hash. Even if multiple users upload the identical file, tenant boundaries are preserved: each user receives their own isolated indexed chunks.
+- **Rate-Limit Resilience**: Batch size is capped at 5 chunks. If Gemini returns HTTP 429, the pipeline applies exponential backoff (15s base, doubling up to 5 retries).
 
 ---
 
@@ -210,40 +333,31 @@ ingest_document(file_path, filename, user_id)
 
 **`app/services/rag_chain.py`**
 
-```
-query(question, document_filter, user_id)
-  │
-  ├─ Step 1: _rewrite_query()
-  │    Gemini rewrites the natural-language question into a
-  │    keyword-rich search query (10–20 words).
-  │    Falls back to original on any failure.
-  │
-  ├─ Step 2: Retrieval
-  │    ├─ ENABLE_HYBRID_SEARCH=True  → _retrieve_hybrid()
-  │    │    ├─ Dense prefetch:  Gemini embed_query (RETRIEVAL_QUERY task)
-  │    │    ├─ Sparse prefetch: BM25 query_embed → SparseVector
-  │    │    ├─ Qdrant query_points with FusionQuery(Fusion.RRF)
-  │    │    └─ Normalise RRF scores to [0, 1]
-  │    └─ ENABLE_HYBRID_SEARCH=False → _retrieve_dense()
-  │         similarity_search_with_relevance_scores via LangChain
-  │
-  ├─ Step 3: _apply_score_threshold()
-  │    Drop chunks below MIN_SCORE_THRESHOLD (default 0.35).
-  │    Keep top MAX_CONTEXT_CHUNKS (default 5).
-  │
-  ├─ Step 4: _format_docs()
-  │    Render chunks → "[Source: X | Page: Y]\n{text}" context string
-  │
-  └─ Step 5: Generation
-       RAG_PROMPT | ChatGoogleGenerativeAI | StrOutputParser
-       NOTE: original question (not rewritten) is sent to LLM
+```mermaid
+flowchart TD
+    START(["Start: query(question, document_filter, user_id)"]) --> STEP1["Step 1: _rewrite_query()<br/>Gemini rewrites input into search keywords"]
+    STEP1 --> HYBRID_CHECK{"ENABLE_HYBRID_SEARCH?"}
+
+    subgraph RetrievalStrategy["Retrieval Strategy"]
+        direction TB
+        HYBRID_CHECK -- "True (Default)" --> DENSE_PRE["Dense Prefetch: Gemini embed_query()"]
+        HYBRID_CHECK -- "True (Default)" --> SPARSE_PRE["Sparse Prefetch: BM25 query_embed()"]
+        DENSE_PRE & SPARSE_PRE --> RRF["Qdrant query_points with Fusion.RRF<br/>(Top 20 candidates per sub-query)"]
+        RRF --> NORM["Normalize RRF scores to [0, 1]"]
+
+        HYBRID_CHECK -- "False" --> DENSE_ONLY["Dense Search: similarity_search_with_relevance_scores()"]
+    end
+
+    NORM --> STEP3["Step 3: _apply_score_threshold()<br/>Drop chunks below MIN_SCORE_THRESHOLD (0.35)<br/>Select top MAX_CONTEXT_CHUNKS (5)"]
+    DENSE_ONLY --> STEP3
+
+    STEP3 --> STEP4["Step 4: _format_docs()<br/>Render: '[Source: filename | Page: N]\nChunk text'"]
+    STEP4 --> STEP5["Step 5: Generation<br/>ChatGoogleGenerativeAI (gemini-2.5-flash)<br/>Prompt with original question + formatted context"]
+    STEP5 --> FINISH(["Return synthesized answer + source citation cards"])
 ```
 
-**Key design choices:**
-
-- The rewritten query is used for **retrieval only**. The original question is passed to the LLM for generation so the answer directly addresses what the user asked.
-- Score threshold runs **after** fetching `RETRIEVAL_TOP_K` candidates (default 10), giving the threshold room to filter without starving the LLM.
-- RRF score normalisation ensures `MIN_SCORE_THRESHOLD` has consistent meaning in both hybrid and dense-only modes.
+- **Query Rewriting**: Converts context-dependent or conversational questions into dense, keyword-rich search queries before hitting Qdrant.
+- **RRF Fusion**: Combines semantic meaning (Gemini dense vectors) with exact lexical matches (BM25 sparse vectors), ensuring acronyms, product names, and specific identifiers are reliably retrieved.
 
 ---
 
@@ -251,26 +365,18 @@ query(question, document_filter, user_id)
 
 **`app/services/vectorstore.py`**
 
-**Collection schema:**
+PaperMind maintains a single Qdrant collection (`documents`) configured for hybrid search:
 
-| Vector | Type | Details |
-|--------|------|---------|
-| `""` (unnamed) | Dense | 3072-dim, cosine distance, Google Gemini |
-| `"text-sparse"` | Sparse | BM25, `Modifier.IDF` (Qdrant applies IDF server-side) |
+| Vector Name | Type | Dimensions / Metric | Purpose |
+|---|---|---|---|
+| `""` (default) | Dense | 3072 dims, Cosine distance | Semantic vector from `gemini-embedding-001` |
+| `"text-sparse"` | Sparse | SparseVector, `Modifier.IDF` | Lexical TF indices from BM25 encoder |
 
-The collection is created lazily by `ensure_collection()` on first ingestion. Toggling `ENABLE_HYBRID_SEARCH` after a collection exists requires deleting and re-ingesting.
-
-**Singleton client:** `get_qdrant_client()` caches the `QdrantClient` at module level. Uses Qdrant Cloud when `QDRANT_URL` + `QDRANT_API_KEY` are set; otherwise local disk persistence.
-
-**Tenant filter helper:**
-
-```python
-_build_tenant_filter(user_id, filename=None)
-# Always adds: metadata.user_id == user_id
-# Optionally adds: metadata.source == filename
-```
-
-Applied on every scroll, search, count, and delete operation.
+- **Server-Side IDF**: Qdrant calculates Inverse Document Frequency dynamically across the collection using `Modifier.IDF`.
+- **Mandatory Tenant Filtering**: Every read, search, scroll, and delete attaches a strict filter:
+  ```python
+  FieldCondition(key="metadata.user_id", match=MatchValue(value=user_id))
+  ```
 
 ---
 
@@ -278,48 +384,60 @@ Applied on every scroll, search, count, and delete operation.
 
 **`app/services/bm25.py`**
 
-A pure-Python, zero-dependency BM25 encoder. No fastembed, no Rust, no NLTK.
+A custom, pure-Python BM25 encoder designed to eliminate heavy native dependencies (e.g., PyTorch, Rust toolchains, fastembed):
 
-**Tokenization pipeline:** lowercase → split on non-alphanumeric → remove English stopwords → Porter-lite suffix stripping → remove tokens shorter than 2 characters.
-
-**Token → index:** FNV-1a 32-bit hash. No vocabulary file needed; collision probability is negligible for typical document vocabularies.
-
-**Output:** `SparseEmbedding(indices: list[int], values: list[float])` where values are raw TF counts. Qdrant applies IDF server-side via `Modifier.IDF`.
-
-BM25 is symmetric (passage and query encoding are identical), so `passage_embed()` and `query_embed()` call the same `encode()` method.
-
-A module-level singleton is returned by `get_bm25_encoder()`.
+- **Tokenization**: Case-folding, non-alphanumeric token splitting, English stopword elimination, and suffix trimming.
+- **Hashing**: Maps tokens to 32-bit vector indices using the deterministic **FNV-1a** hash algorithm.
+- **Output**: Generates `SparseEmbedding(indices, values)` where values represent raw Term Frequencies (TF).
 
 ---
 
-### Storage Abstraction
+### Storage Abstraction (Cloudflare R2)
 
 **`app/services/storage.py`**
 
-| Function | Local (dev) | Cloud (prod) |
-|----------|-------------|--------------|
-| `upload_file()` | Returns local path unchanged | Uploads to Cloudinary, returns HTTPS URL |
-| `download_for_processing()` | Returns path unchanged | Downloads URL to temp file |
-| `delete_file()` | No-op (upload.py handles local cleanup) | Destroys Cloudinary asset |
+PaperMind uses **Cloudflare R2** for production file storage, replacing legacy media hosts.
 
-`is_cloud_storage_enabled()` checks all three Cloudinary env vars. When enabled, the local file copy is deleted immediately after the Cloudinary upload succeeds.
+| Feature | Cloudflare R2 Implementation |
+|---|---|
+| **Protocol** | Standard S3 API via `boto3` client |
+| **Egress Cost** | **Zero egress fees** — worker downloads for ingestion are free |
+| **Key Namespace** | `rag-uploads/{user_id}/{document_id}{.ext}` for natural tenant partitioning |
+| **Access Control** | Private bucket; downloads use time-limited pre-signed URLs (`generate_download_url`) |
+| **Local Dev Fallback** | When R2 env vars are omitted, saves directly to `./uploads/` on local disk |
+
+#### Key Storage Functions
+
+- `upload_file(local_path, filename, *, user_id, document_id) -> str`: Uploads the file to R2 with the appropriate `ContentType` header and returns the object key. In dev mode, returns the local path.
+- `generate_download_url(r2_key, expires_in=3600) -> str`: Generates a temporary, signed S3 `get_object` URL.
+- `download_for_processing(file_url_or_path, suffix) -> str`: Resolves any storage reference (local path, R2 key, or HTTP URL) to a local temporary file for parser ingestion.
+- `delete_file(r2_key) -> None`: Deletes the object from Cloudflare R2 when a document is deleted.
 
 ---
 
-### Status Store
+### Dual Redis Roles: Status Store vs Task Queue
 
-**`app/services/status_store.py`**
+PaperMind utilizes Redis for two separate, specialized responsibilities:
 
-Abstracts job status storage behind a simple `set_status / get_status / update_status` interface. The backend is selected at runtime based on whether Upstash credentials are configured.
+```mermaid
+flowchart LR
+    subgraph StatusRole["1. Status Store (Upstash Redis REST)"]
+        direction TB
+        API_UP["FastAPI Upload Endpoint"] -->|"set_status('queued')"| REST_DB[("Upstash Redis (REST)")]
+        WORKER_STAT["ARQ Worker"] -->|"update_status('processing'/'completed')"| REST_DB
+        POLL_CLIENT["Next.js Client"] -->|"GET /api/documents/status/{id}"| API_STAT["FastAPI Status Endpoint"]
+        API_STAT -->|"get_status(id)"| REST_DB
+    end
 
-| Backend | When used | Notes |
-|---------|-----------|-------|
-| Upstash Redis (HTTP/REST) | `UPSTASH_REDIS_REST_URL` is set | Serverless, survives restarts, multi-worker safe |
-| In-memory dict | No env vars | Zero setup for local dev; does not survive restarts |
+    subgraph QueueRole["2. Task Queue (Standard TCP Redis)"]
+        direction TB
+        API_ENQ["FastAPI Upload Endpoint"] -->|"enqueue_job('run_ingestion')"| TCP_DB[("TCP Redis Broker<br/>(REDIS_URL)")]
+        TCP_DB -->|"Atomic pop & lock"| ARQ_PROC["ARQ Ingestion Worker"]
+        ARQ_PROC -->|"Auto-retry with exponential backoff"| TCP_DB
+    end
+```
 
-Redis keys are namespaced as `ingestion:{document_id}` with a 24-hour TTL. After expiry a 404 is returned to polling clients, which is correct (the job is long gone).
-
-`update_status()` does a read-modify-write to merge partial updates without losing fields like `user_id` and `filename`.
+This separation allows clients to poll ingestion status over lightweight, serverless HTTP REST connections without exhausting persistent TCP connection pools required by worker task schedulers.
 
 ---
 
@@ -327,11 +445,8 @@ Redis keys are namespaced as `ingestion:{document_id}` with a 24-hour TTL. After
 
 **`app/utils/parsers.py`**
 
-**PDF** (`parse_pdf`): PyMuPDF (`fitz`). Extracts text blocks per page using the `"blocks"` layout mode, which preserves table structures. Detects and strips repeated header/footer text (lines appearing on more than 50% of pages).
-
-**DOCX** (`parse_docx`): `python-docx`. Extracts all paragraph text and groups into page-like sections of 30 paragraphs each. Applies the same repeated-text stripping for boilerplate headers/footers.
-
-Both parsers return a list of `{text: str, metadata: {page_number: int, source: str}}` dicts.
+- **PDF Parsing (`parse_pdf`)**: Powered by `PyMuPDF` (`fitz`). Uses `"blocks"` layout extraction to preserve tabular data structures. Analyzes all pages to identify and strip repeated header and footer lines occurring across >50% of the document.
+- **DOCX Parsing (`parse_docx`)**: Powered by `python-docx`. Extracts paragraph text, aggregates into 30-paragraph synthetic pages, and applies repeated-line boilerplate filtering.
 
 ---
 
@@ -339,20 +454,31 @@ Both parsers return a list of `{text: str, metadata: {page_number: int, source: 
 
 **`app/config.py`**
 
-`Settings` extends Pydantic `BaseSettings`, reading from environment variables and `.env`. An `lru_cache`-wrapped `get_settings()` function ensures a single instance is shared across the app.
+Managed via Pydantic Settings (`BaseSettings`) and cached via `lru_cache`:
 
-Notable settings:
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `MIN_SCORE_THRESHOLD` | `0.35` | Minimum relevance score to pass to LLM |
-| `RETRIEVAL_TOP_K` | `10` | Candidates fetched before threshold filtering |
-| `MAX_CONTEXT_CHUNKS` | `5` | Max chunks sent to LLM after filtering |
-| `ENABLE_HYBRID_SEARCH` | `True` | Dense + BM25 via RRF vs dense-only |
-| `HYBRID_PREFETCH_LIMIT` | `20` | Top-N per sub-query before RRF fusion |
-| `CHUNK_SIZE` | `500` | Tokens per chunk (tiktoken cl100k_base) |
-| `CHUNK_OVERLAP` | `50` | Token overlap between consecutive chunks |
-| `EMBEDDING_DIM` | `3072` | Gemini `gemini-embedding-001` output dimension |
+| Setting | Default | Description |
+|---|---|---|
+| `GOOGLE_API_KEY` | *Required* | Google AI Studio API key |
+| `CLERK_ISSUER` | *Required* | Clerk Frontend API issuer URL |
+| `REDIS_URL` | `redis://localhost:6379` | Standard TCP Redis URL for ARQ queue |
+| `ARQ_MAX_JOBS` | `2` | Maximum concurrent jobs per ARQ worker |
+| `ARQ_JOB_TIMEOUT` | `600` | Job execution timeout in seconds |
+| `ARQ_MAX_TRIES` | `5` | Maximum retry attempts for failed jobs |
+| `R2_ACCOUNT_ID` | `None` | Cloudflare Account ID |
+| `R2_ACCESS_KEY_ID` | `None` | Cloudflare R2 API Access Key |
+| `R2_SECRET_ACCESS_KEY` | `None` | Cloudflare R2 API Secret Key |
+| `R2_BUCKET_NAME` | `papermind-uploads` | Cloudflare R2 Bucket Name |
+| `R2_ENDPOINT_URL` | `None` | `https://{account_id}.r2.cloudflarestorage.com` |
+| `UPSTASH_REDIS_REST_URL` | `None` | Upstash Redis REST URL for status store |
+| `UPSTASH_REDIS_REST_TOKEN` | `None` | Upstash Redis REST token |
+| `QDRANT_URL` | `None` | Qdrant Cloud URL |
+| `QDRANT_API_KEY` | `None` | Qdrant Cloud API key |
+| `ENABLE_HYBRID_SEARCH` | `True` | Toggles dense + BM25 RRF fusion |
+| `MIN_SCORE_THRESHOLD` | `0.35` | Minimum relevance threshold |
+| `RETRIEVAL_TOP_K` | `10` | Candidate chunk retrieval count |
+| `MAX_CONTEXT_CHUNKS` | `5` | Maximum chunks passed to LLM |
+| `CHUNK_SIZE` | `500` | Tokens per chunk (cl100k_base) |
+| `CHUNK_OVERLAP` | `50` | Token overlap between chunks |
 
 ---
 
@@ -360,70 +486,27 @@ Notable settings:
 
 ### Auth & Middleware
 
-**`middleware.ts`** runs at the Next.js Edge before every request. All routes are protected except `/sign-in` and `/sign-up`. Unauthenticated users are redirected to `/sign-in` automatically.
-
-**`layout.tsx`** wraps the entire app in `ClerkProvider`. No props needed — Clerk reads `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` from the environment automatically.
-
----
+- **`middleware.ts`**: Runs on Next.js Edge runtime. Intercepts all requests and redirects unauthenticated sessions to `/sign-in`.
+- **`app/layout.tsx`**: Wraps application tree in `ClerkProvider`.
 
 ### Page Layout
 
-**`app/page.tsx`**
-
-Holds the three top-level state values shared across components:
-
-- `selectedDocument` — filename string or `null` (all docs). Passed as a filter to the chat and displayed as a badge in the header.
-- `refreshTrigger` — integer incremented on upload completion to tell `DocumentList` to refetch.
-- `sidebarOpen` — mobile sidebar visibility toggle.
-
-`getToken` from `useAuth()` is passed down to every child component that makes API calls, ensuring tokens are fetched fresh on every request.
-
----
+**`app/page.tsx`**: Maintains shared UI states:
+- `selectedDocument`: Active document filter (or `null` for all documents).
+- `refreshTrigger`: Counter incremented when uploads complete to trigger `DocumentList` re-fetching.
+- `sidebarOpen`: Mobile navigation state.
 
 ### Components
 
-#### `FileUpload.tsx`
-
-Drag-and-drop zone using `react-dropzone`. Validates file type and size client-side before uploading. State machine with five phases: `idle → uploading → processing → done | error`.
-
-After receiving the `document_id` from the upload response, it calls `pollUntilComplete()` every 2 seconds (max 120 seconds) until status is `completed` or `duplicate`. On success, it calls `onUploadComplete` to trigger a document list refresh.
-
-#### `DocumentList.tsx`
-
-Lists ingested documents fetched from `GET /api/documents`. Auto-refreshes every 30 seconds. Supports per-document selection (sets the `selectedDocument` filter) and deletion with a two-step confirm flow. Delete state is a discriminated union: `idle | confirming | deleting | error`.
-
-#### `ChatWindow.tsx`
-
-Auto-expanding textarea (max 144px), Enter to submit, Shift+Enter for newline. Appends `UserMessage`, shows a `TypingIndicator` during loading, then appends `AssistantMessage` or `ErrorMessage`. Scrolls to the bottom after each update.
-
-#### `MessageBubble.tsx`
-
-Renders the three message roles:
-- **user** — plain text, right-aligned blue bubble.
-- **assistant** — full Markdown via `react-markdown` + `remark-gfm` with custom Tailwind-styled component overrides for all block and inline elements including tables, code blocks, and task lists.
-- **error** — red-bordered warning bubble.
-
-Source chunks are rendered below the answer via `SourceList`.
-
-#### `SourceCard.tsx`
-
-Each retrieved chunk is shown as a card with filename, page number, a colour-coded relevance score badge (green >80%, yellow >60%, grey otherwise), a score bar, and expandable chunk text (collapsed at 160 characters).
-
----
+- **`FileUpload.tsx`**: Drag-and-drop file target via `react-dropzone`. Submits upload to `POST /api/documents/upload`, receives `document_id`, and initiates status polling via `pollUntilComplete()` at 2-second intervals.
+- **`DocumentList.tsx`**: Sidebar displaying user documents fetched from `GET /api/documents`. Includes deletion with a two-step confirmation state.
+- **`ChatWindow.tsx`**: Chat container with auto-expanding prompt textarea, loading states, and automatic bottom scrolling.
+- **`MessageBubble.tsx`**: Renders user and assistant messages with full GitHub Flavored Markdown (GFM) styling for code blocks, tables, and lists.
+- **`SourceCard.tsx`**: Displays attributed source document name, page number, relevance score indicator, and expandable chunk text.
 
 ### API Client
 
-**`lib/api.ts`**
-
-Thin typed wrapper around `fetch`. All authenticated calls receive a `GetToken` callback (`() => Promise<string | null>`) instead of storing a token in module state, preventing stale-token bugs.
-
-`apiFetch<T>()` handles:
-- Calling `getToken()` fresh on every request.
-- Attaching `Authorization: Bearer {token}`.
-- Parsing error bodies for a `detail` field to surface readable messages.
-- Throwing `ApiError(status, detail)` for non-2xx responses.
-
-`pollUntilComplete()` implements a recursive `setTimeout` loop with a configurable interval and deadline timeout, resolving on `completed`/`duplicate` and rejecting on `failed` or timeout.
+**`lib/api.ts`**: Typed client wrapper around `fetch`. Uses a dynamic `getToken` callback to ensure fresh Clerk tokens on every request without storing tokens in application state.
 
 ---
 
@@ -431,65 +514,143 @@ Thin typed wrapper around `fetch`. All authenticated calls receive a `GetToken` 
 
 ### Upload & Ingestion Flow
 
-```
-Browser                     Backend                      External
-  │                             │                            │
-  │── POST /upload ────────────►│                            │
-  │   (multipart/form-data)     │── write to disk ──────────►│ (local)
-  │                             │── upload_file() ──────────►│ Cloudinary
-  │                             │── set_status("queued") ───►│ Redis/mem
-  │◄── 202 { document_id } ─────│                            │
-  │                             │                            │
-  │   (background task starts)  │                            │
-  │                             │── update_status("processing")
-  │                             │── parse_document()         │
-  │                             │── RecursiveTextSplitter    │
-  │                             │── embed_documents() ──────►│ Gemini
-  │                             │── passage_embed()          │ (BM25 local)
-  │                             │── client.upsert() ────────►│ Qdrant
-  │                             │── update_status("completed")
-  │                             │                            │
-  │── GET /status/{id} ────────►│                            |
-  │◄── { status: "completed" } ─│                            │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User Browser
+    participant FE as Next.js Frontend
+    participant API as FastAPI Web Server
+    participant R2 as Cloudflare R2
+    participant Status as Upstash Status Store
+    participant Queue as Redis ARQ Queue
+    participant Worker as ARQ Ingestion Worker
+    participant Gemini as Google Gemini API
+    participant Qdrant as Qdrant Vector DB
+
+    User->>FE: Select & Upload File (PDF/DOCX)
+    FE->>API: POST /api/documents/upload (Multipart)
+    API->>R2: upload_file() (S3 key: rag-uploads/{user_id}/{doc_id}.ext)
+    API->>Status: set_status("queued")
+    API->>Queue: enqueue_ingestion_job(document_id, ...)
+    API-->>FE: HTTP 202 Accepted { document_id, status: "queued" }
+
+    par Polling Loop (Client Side)
+        loop Every 2 Seconds
+            FE->>API: GET /api/documents/status/{document_id}
+            API->>Status: get_status(document_id)
+            Status-->>API: Current Status
+            API-->>FE: { status: "queued" | "processing" }
+        end
+    and Worker Execution (Decoupled Background)
+        Queue->>Worker: Consume "run_ingestion" task
+        Worker->>Status: update_status("processing")
+        Worker->>R2: generate_download_url() & download to tempfile
+        Worker->>Worker: Parse text & chunk (tiktoken)
+        loop Batches of 5 Chunks
+            Worker->>Gemini: embed_documents() (Dense vectors)
+            Worker->>Worker: BM25 passage_embed() (Sparse vectors)
+            Worker->>Qdrant: client.upsert() (Dense + Sparse with user_id)
+        end
+        Worker->>Status: update_status("completed", chunks_count)
+    end
+
+    FE->>API: GET /api/documents/status/{document_id}
+    API->>Status: get_status(document_id)
+    Status-->>API: { status: "completed", chunks_count: N }
+    API-->>FE: HTTP 200 { status: "completed" }
+    FE->>User: Display success banner & trigger document list refresh
 ```
 
 ### Query Flow
 
-```
-Browser                     Backend                      External
-  │                             │                            │
-  │── POST /query ─────────────►│                            │
-  │   { question, filter }      │                            │
-  │                             │── _rewrite_query() ───────►│ Gemini LLM
-  │                             │── embed_query() ──────────►│ Gemini Embed
-  │                             │── query_embed() (BM25)     │
-  │                             │── query_points (RRF) ─────►│ Qdrant
-  │                             │── _apply_score_threshold() │
-  │                             │── RAG_PROMPT | LLM ───────►│ Gemini LLM
-  │◄── { answer, sources } ─────│                            │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User Browser
+    participant FE as Next.js Frontend
+    participant API as FastAPI Backend
+    participant Gemini as Google Gemini
+    participant BM25 as Local BM25 Encoder
+    participant Qdrant as Qdrant Vector DB
+
+    User->>FE: Submit Question in Chat
+    FE->>API: POST /api/query { question, document_filter }
+    API->>Gemini: _rewrite_query(question)
+    Gemini-->>API: Search-optimized keyword query
+    par Parallel Embedding Generation
+        API->>Gemini: embed_query(rewritten_query) [Dense 3072-dim]
+        Gemini-->>API: Dense query vector
+    and Sparse BM25 Encoding
+        API->>BM25: query_embed(rewritten_query)
+        BM25-->>API: Sparse query vector (indices + TF)
+    end
+    API->>Qdrant: query_points(Dense + Sparse with Fusion.RRF, filter: user_id)
+    Qdrant-->>API: Candidate points with normalized RRF scores
+    API->>API: _apply_score_threshold(min_score=0.35, max_chunks=5)
+    API->>API: _format_docs(chunks) -> Formatted context string
+    API->>Gemini: ChatGoogleGenerativeAI(Prompt with context + original question)
+    Gemini-->>API: Grounded answer text
+    API-->>FE: HTTP 200 { answer, sources: [{ filename, page, score, text }] }
+    FE->>User: Render Markdown answer + confidence-graded source cards
 ```
 
 ---
 
 ## Tenant Isolation
 
-Every Qdrant point payload includes `metadata.user_id` set to the Clerk `userId`. All reads, searches, and deletes apply a mandatory `FieldCondition(key="metadata.user_id", match=user_id)` filter.
+1. **Vector Store**: Every Qdrant point payload contains `metadata.user_id`. All retrieval, scroll, and deletion operations enforce a mandatory database-level filter matching the authenticated Clerk `user_id`. Cross-tenant data retrieval is impossible at the query layer.
+2. **Object Storage (R2)**: Raw files are partitioned by user ID (`rag-uploads/{user_id}/{document_id}{.ext}`). File downloads are generated via single-use, time-limited pre-signed URLs.
+3. **Status Store**: Job status lookups verify that `record["user_id"] == current_user.user_id`. Unmatched or nonexistent jobs return HTTP 404 to avoid tenant ID enumeration.
 
-A single Qdrant collection (`documents`) serves all users. This is more scalable than per-user collections and avoids Qdrant's collection-count overhead. The filter is applied at the database level, so cross-tenant data leakage is not possible even if application logic has a bug.
+---
 
-The status store returns 404 for both missing records and records owned by a different user, preventing user enumeration of job IDs.
+## Containerization & Deployment
+
+PaperMind provides production-ready Docker containers and Docker Compose orchestration:
+
+```mermaid
+flowchart TD
+    subgraph DockerCompose["docker-compose.yml Service Topology"]
+        subgraph InternalNetwork["Internal Bridge Network"]
+            REDIS["redis<br/>image: redis:7-alpine<br/>Exposed: 6379:6379"]
+            FASTAPI["fastapi<br/>image: backend:latest<br/>uvicorn app.main:app<br/>Exposed: 8000:8000"]
+            ARQ1["arq-worker<br/>image: backend:latest<br/>arq app.worker.WorkerSettings"]
+            ARQ2["arq-worker-replica<br/>(Horizontal Scale Instance)"]
+            FRONTEND["frontend<br/>image: frontend:standalone<br/>Next.js Server<br/>Exposed: 3000:3000"]
+        end
+
+        VOL_REDIS[("Volume: redis_data")] --- REDIS
+        VOL_UPLOADS[("Volume: uploads_data")] --- FASTAPI & ARQ1 & ARQ2
+        VOL_QDRANT[("Volume: qdrant_data")] --- FASTAPI & ARQ1 & ARQ2
+    end
+
+    FASTAPI -->|"TCP Connection (REDIS_URL)"| REDIS
+    ARQ1 & ARQ2 -->|"Pops ingestion tasks"| REDIS
+    FRONTEND -->|"HTTP REST Requests"| FASTAPI
+
+    CLIENT["Browser Client"] -->|"http://localhost:3000"| FRONTEND
+    PROBE["Health Probe / Direct API"] -->|"http://localhost:8000"| FASTAPI
+```
+
+- **Backend Dockerfile (`backend/Dockerfile`)**: Multi-stage build using `python:3.12-slim`. Serves both the FastAPI web server (`uvicorn app.main:app`) and the ARQ worker (`arq app.worker.WorkerSettings`) from the identical container image. Runs under a non-root `appuser`.
+- **Frontend Dockerfile (`frontend/Dockerfile`)**: 3-stage build with `output: "standalone"`. Bakes `NEXT_PUBLIC_*` build arguments at build time, yielding a secure, minimal runtime image (~200MB).
+- **Worker Scaling**: Scale background workers with:
+  ```bash
+  docker compose up --scale arq-worker=3 -d
+  ```
 
 ---
 
 ## Dev vs Production Backends
 
-| Component | Local Dev | Production |
-|-----------|-----------|------------|
-| File storage | Local `./uploads/` directory | Cloudinary (set `CLOUDINARY_*` vars) |
-| Job status | In-memory Python dict | Upstash Redis (set `UPSTASH_*` vars) |
-| Vector DB | Local disk `./qdrant_data/` | Qdrant Cloud (set `QDRANT_URL` + `QDRANT_API_KEY`) |
+| Component | Local Development | Production Environment |
+|---|---|---|
+| **Object Storage** | Local directory (`./uploads/`) | Cloudflare R2 (`R2_*` environment variables) |
+| **Task Queue** | Local Redis container (`localhost:6379`) | Managed TCP Redis (e.g. Upstash TLS TCP endpoint) |
+| **Job Status** | In-memory Python dictionary | Upstash Redis REST (`UPSTASH_REDIS_REST_*`) |
+| **Vector DB** | Local disk directory (`./qdrant_data/`) | Qdrant Cloud (`QDRANT_URL`, `QDRANT_API_KEY`) |
 
-All three switches are fully automatic — no code changes needed. Dev mode requires only a `GOOGLE_API_KEY` and a `CLERK_ISSUER` to run end-to-end.
+Switching between local dev and cloud backends is fully automated based on the presence of environment variables.
 
 ---
 
@@ -497,23 +658,35 @@ All three switches are fully automatic — no code changes needed. Dev mode requ
 
 ### Backend (`backend/.env`)
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GOOGLE_API_KEY` | ✅ | Gemini embeddings + LLM |
-| `CLERK_ISSUER` | ✅ | Clerk Frontend API URL for JWKS verification |
-| `CORS_ORIGINS` | — | Comma-separated allowed origins (default: localhost:3000) |
-| `QDRANT_URL` | — | Qdrant Cloud endpoint (omit for local) |
-| `QDRANT_API_KEY` | — | Qdrant Cloud API key |
-| `UPSTASH_REDIS_REST_URL` | — | Upstash REST URL (omit for in-memory) |
-| `UPSTASH_REDIS_REST_TOKEN` | — | Upstash REST token |
-| `CLOUDINARY_CLOUD_NAME` | — | Cloudinary cloud name (omit for local storage) |
-| `CLOUDINARY_API_KEY` | — | Cloudinary API key |
-| `CLOUDINARY_API_SECRET` | — | Cloudinary API secret |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GOOGLE_API_KEY` | ✅ | — | Gemini embedding & LLM generation API key |
+| `CLERK_ISSUER` | ✅ | — | Clerk Frontend API issuer URL for JWKS RS256 verification |
+| `REDIS_URL` | — | `redis://localhost:6379` | Standard TCP Redis connection URL for ARQ |
+| `ARQ_MAX_JOBS` | — | `2` | Max concurrent jobs per worker |
+| `ARQ_JOB_TIMEOUT` | — | `600` | Ingestion timeout in seconds |
+| `ARQ_MAX_TRIES` | — | `5` | Maximum retry attempts per job |
+| `R2_ACCOUNT_ID` | — | — | Cloudflare Account ID |
+| `R2_ACCESS_KEY_ID` | — | — | Cloudflare R2 Access Key ID |
+| `R2_SECRET_ACCESS_KEY` | — | — | Cloudflare R2 Secret Access Key |
+| `R2_BUCKET_NAME` | — | `papermind-uploads` | Cloudflare R2 bucket name |
+| `R2_ENDPOINT_URL` | — | — | Cloudflare R2 endpoint URL |
+| `UPSTASH_REDIS_REST_URL` | — | — | Upstash Redis REST URL for status store |
+| `UPSTASH_REDIS_REST_TOKEN` | — | — | Upstash Redis REST token |
+| `QDRANT_URL` | — | — | Qdrant Cloud endpoint URL |
+| `QDRANT_API_KEY` | — | — | Qdrant Cloud API key |
+| `CORS_ORIGINS` | — | `http://localhost:3000` | Comma-separated allowed CORS origins |
+| `ENABLE_HYBRID_SEARCH` | — | `true` | Enables dense + BM25 RRF hybrid retrieval |
+| `MIN_SCORE_THRESHOLD` | — | `0.35` | Minimum chunk relevance score |
+| `RETRIEVAL_TOP_K` | — | `10` | Chunks retrieved before filtering |
+| `MAX_CONTEXT_CHUNKS` | — | `5` | Context chunks delivered to LLM |
+| `CHUNK_SIZE` | — | `500` | Tokens per chunk (cl100k_base) |
+| `CHUNK_OVERLAP` | — | `50` | Token overlap between consecutive chunks |
 
-### Frontend (`frontend/.env.local`)
+### Frontend (`frontend/.env.local` / `frontend/.env`)
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | ✅ | Clerk publishable key |
-| `CLERK_SECRET_KEY` | ✅ | Clerk secret key (server-side) |
-| `NEXT_PUBLIC_API_URL` | — | Backend base URL (default: `http://localhost:8000`) |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | ✅ | — | Clerk publishable key |
+| `CLERK_SECRET_KEY` | ✅ | — | Clerk secret key for server-side verification |
+| `NEXT_PUBLIC_API_URL` | — | `http://localhost:8000` | FastAPI backend URL |
