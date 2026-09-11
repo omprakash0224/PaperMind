@@ -186,7 +186,7 @@ def ingest_document(file_path: str, filename: str, *, user_id: str) -> dict:
          — retries with exponential backoff on 429 rate-limit errors
 
     Args:
-        file_path: Local path or Cloudinary URL to the uploaded file.
+        file_path: Local path or Cloudflare R2 object key to the uploaded file.
         filename:  Original filename (used as the source metadata key).
         user_id:   Clerk userId — stamped into every chunk for tenant isolation.
 
