@@ -111,7 +111,9 @@ class WorkerSettings:
     max_jobs          = settings.ARQ_MAX_JOBS     # concurrent jobs (default 2)
     job_timeout       = settings.ARQ_JOB_TIMEOUT  # seconds before job is killed (default 600)
     max_tries         = settings.ARQ_MAX_TRIES    # retry attempts (default 5)
-    keep_result       = 3600                      # keep result in Redis for 1 hour
     retry_jobs        = True
-    # Exponential backoff: 15s, 30s, 60s, 120s, 240s between retries
-    health_check_interval = 30
+    poll_delay            = 5.0
+    health_check_interval = 120.0
+
+    keep_result           = 60
+    keep_result_forever   = False
