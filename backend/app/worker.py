@@ -20,6 +20,7 @@ process and can be scaled horizontally by running multiple instances.
 """
 
 import logging
+import asyncio
 
 from arq.connections import RedisSettings
 
@@ -59,7 +60,13 @@ async def run_ingestion(
     update_status(document_id, {"status": "processing"})
 
     try:
-        result = ingest_document(file_path, filename, user_id=user_id)
+        result = await asyncio.to_thread(
+            ingest_document,
+            file_path,
+            filename,
+            user_id=user_id,
+            status_document_id=document_id,
+        )
 
         update_status(document_id, {
             "status":       result["status"],

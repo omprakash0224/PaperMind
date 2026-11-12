@@ -156,7 +156,7 @@ export async function pollUntilComplete(
   documentId: string,
   getToken:   GetToken,
   intervalMs  = 2_000,
-  timeoutMs   = 300_000,
+  timeoutMs   = 600_000,
 ): Promise<IngestionStatus> {
   const deadline = Date.now() + timeoutMs;
 

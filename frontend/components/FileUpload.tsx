@@ -44,7 +44,7 @@ export default function FileUpload({ onUploadComplete, getToken }: FileUploadPro
 
         setUploadState({ phase: "processing", filename: file.name, message: "Parsing and embedding document…" });
 
-        const finalStatus = await pollUntilComplete(uploadRes.document_id, getToken, 2_000, 120_000);
+        const finalStatus = await pollUntilComplete(uploadRes.document_id, getToken, 2_000, 600_000);
 
         const isDuplicate = finalStatus.status === "duplicate";
         setUploadState({

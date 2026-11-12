@@ -14,6 +14,26 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "gemini-embedding-001"
     EMBEDDING_DIM: int = 3072
 
+    # -- Embedding throughput / rate limiting ---------------------------------
+    # Gemini Developer API free tier (gemini-embedding-001):
+    #   RPM 100 | TPM 30,000 | RPD 1,000   (per project)
+    # TPM is the binding constraint, so batches are built by token budget
+    # rather than a fixed chunk count.
+    #
+    # Token budget per pacing batch. LangChain may further split this
+    # internally using its own conservative token estimate, so a single
+    # pacing batch is not guaranteed to be a single HTTP request.
+    EMBED_MAX_TOKENS_PER_REQUEST: int = 8000
+    # Hard cap on texts per pacing batch (Gemini API allows up to 100).
+    EMBED_BATCH_SIZE: int = 64
+    # Sliding 60s window limits. Kept below the published free-tier ceilings
+    # (30,000 TPM / 100 RPM) to absorb tokenizer variance and bursts.
+    EMBED_TPM_LIMIT: int = 25000
+    EMBED_RPM_LIMIT: int = 90
+    # 429 backoff: delay = base * 2^(attempt-1) * jitter, capped at 60s.
+    EMBED_MAX_RETRIES: int = 5
+    EMBED_RETRY_BASE: float = 5.0
+
     # -- Clerk Auth -----------------------------------------------------------
     # Your Clerk Frontend API URL -- shown in Clerk Dashboard -> API Keys
     # Dev:  https://<clerk-subdomain>.clerk.accounts.dev
