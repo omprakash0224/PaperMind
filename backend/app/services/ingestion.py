@@ -145,10 +145,14 @@ def _build_token_batches(
     return batches
 
 
+# ── Tokenizer caching ────────────────────────────────────────────────────────
+# Cache tiktoken encoding once at module load to avoid re-instantiation per chunk
+_TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+
+
 def _tiktoken_length(text: str) -> int:
-    """Token counter using cl100k_base (GPT-4 / text-embedding-3 compatible)."""
-    enc = tiktoken.get_encoding("cl100k_base")
-    return len(enc.encode(text))
+    """Token counter using cached cl100k_base encoder."""
+    return len(_TIKTOKEN_ENC.encode(text))
 
 
 def _compute_file_hash(file_path: str) -> str:
@@ -208,6 +212,7 @@ def _doc_hash_exists(file_hash: str, user_id: str) -> dict | None:
 def _upsert_batch_with_retry(
     batch:      list[Document],
     embeddings: GoogleGenerativeAIEmbeddings,
+    wait:       bool = True,
 ) -> None:
     """
     Embed a batch of chunks (dense + sparse) and upsert into Qdrant.
@@ -267,6 +272,7 @@ def _upsert_batch_with_retry(
             client.upsert(
                 collection_name=settings.COLLECTION_NAME,
                 points=points,
+                wait=wait,
             )
             return  # success — exit retry loop
 
@@ -434,7 +440,8 @@ def ingest_document(
                 rpm=settings.EMBED_RPM_LIMIT,
             )
 
-            _upsert_batch_with_retry(batch, embeddings)
+            is_last = (batch_num == total_batches)
+            _upsert_batch_with_retry(batch, embeddings, wait=is_last)
 
             embedded += len(batch)
             if status_document_id:

@@ -103,6 +103,29 @@ def ensure_collection() -> None:
     client   = get_qdrant_client()
     existing = [c.name for c in client.get_collections().collections]
 
+    if settings.COLLECTION_NAME in existing:
+        try:
+            col_info = client.get_collection(settings.COLLECTION_NAME)
+            vectors_cfg = col_info.config.params.vectors
+            current_dim = None
+            if hasattr(vectors_cfg, "size"):
+                current_dim = vectors_cfg.size
+            elif isinstance(vectors_cfg, dict):
+                default_v = vectors_cfg.get("") or next(iter(vectors_cfg.values()), None)
+                if default_v and hasattr(default_v, "size"):
+                    current_dim = default_v.size
+
+            if current_dim and current_dim != settings.EMBEDDING_DIM:
+                logger.warning(
+                    "Collection '%s' vector dimension mismatch: existing=%d vs configured=%d. "
+                    "Recreating collection...",
+                    settings.COLLECTION_NAME, current_dim, settings.EMBEDDING_DIM,
+                )
+                client.delete_collection(settings.COLLECTION_NAME)
+                existing.remove(settings.COLLECTION_NAME)
+        except Exception as exc:
+            logger.warning("Could not check collection '%s' dimension: %s", settings.COLLECTION_NAME, exc)
+
     if settings.COLLECTION_NAME not in existing:
         sparse_vectors_config = {}
 

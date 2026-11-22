@@ -74,6 +74,9 @@ _STEM_RULES = [
     ("s",       ""),
 ]
 
+# Pre-compiled word tokenizer regex
+_WORD_REGEX = re.compile(r"[a-z0-9]+")
+
 # Minimum token length after stemming — avoids single-char noise tokens
 _MIN_TOKEN_LEN = 2
 
@@ -102,7 +105,7 @@ def _tokenize(text: str) -> list[str]:
     Returns a list of stemmed tokens (may contain duplicates — TF counts them).
     """
     text  = text.lower()
-    words = re.findall(r"[a-z0-9]+", text)
+    words = _WORD_REGEX.findall(text)
     words = [w for w in words if len(w) >= _MIN_TOKEN_LEN and w not in _STOPWORDS]
     words = [_stem(w) for w in words]
     # Re-filter after stemming in case stemming created short tokens

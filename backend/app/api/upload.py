@@ -13,6 +13,7 @@ a separate `arq app.worker.WorkerSettings` worker process. This keeps
 the web server event loop fully unblocked during long ingestion tasks.
 """
 
+import hashlib
 import logging
 import uuid
 from pathlib import Path
@@ -27,6 +28,7 @@ from app.services.vectorstore import delete_document, list_documents
 from app.services.storage import upload_file, is_cloud_storage_enabled, delete_file
 from app.services.status_store import set_status, get_status
 from app.services.queue import enqueue_ingestion_job
+from app.services.ingestion import _doc_hash_exists
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
@@ -78,6 +80,21 @@ async def upload_document(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Uploaded file is empty.",
+        )
+
+    # -- Fast duplicate check before disk/R2 upload ---------------------------
+    file_hash = hashlib.sha256(content).hexdigest()
+    existing = _doc_hash_exists(file_hash, current_user.user_id)
+    if existing:
+        logger.info(
+            "Duplicate detected at upload time for '%s' (hash=%s, user=%s). Returning existing.",
+            original_filename, file_hash[:12], current_user.user_id,
+        )
+        return UploadResponse(
+            document_id=existing["document_id"],
+            filename=existing["filename"],
+            chunks_count=existing["chunks_count"],
+            status="duplicate",
         )
 
     # -- Build safe filename --------------------------------------------------

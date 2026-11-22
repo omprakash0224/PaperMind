@@ -7,29 +7,27 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: str
     QDRANT_PERSIST_DIR: str = "./qdrant_data"
     UPLOAD_DIR: str = "./uploads"
-    CHUNK_SIZE: int = 500
-    CHUNK_OVERLAP: int = 50
+    CHUNK_SIZE: int = 800
+    CHUNK_OVERLAP: int = 80
     COLLECTION_NAME: str = "documents"
     GEMINI_MODEL: str = "gemini-2.5-flash"
-    EMBEDDING_MODEL: str = "gemini-embedding-001"
-    EMBEDDING_DIM: int = 3072
+    EMBEDDING_MODEL: str = "text-embedding-004"
+    EMBEDDING_DIM: int = 768
 
     # -- Embedding throughput / rate limiting ---------------------------------
-    # Gemini Developer API free tier (gemini-embedding-001):
+    # Gemini Developer API free tier (text-embedding-004):
     #   RPM 100 | TPM 30,000 | RPD 1,000   (per project)
     # TPM is the binding constraint, so batches are built by token budget
     # rather than a fixed chunk count.
     #
-    # Token budget per pacing batch. LangChain may further split this
-    # internally using its own conservative token estimate, so a single
-    # pacing batch is not guaranteed to be a single HTTP request.
-    EMBED_MAX_TOKENS_PER_REQUEST: int = 8000
+    # Token budget per pacing batch.
+    EMBED_MAX_TOKENS_PER_REQUEST: int = 9500
     # Hard cap on texts per pacing batch (Gemini API allows up to 100).
-    EMBED_BATCH_SIZE: int = 64
+    EMBED_BATCH_SIZE: int = 90
     # Sliding 60s window limits. Kept below the published free-tier ceilings
     # (30,000 TPM / 100 RPM) to absorb tokenizer variance and bursts.
     EMBED_TPM_LIMIT: int = 25000
-    EMBED_RPM_LIMIT: int = 90
+    EMBED_RPM_LIMIT: int = 85
     # 429 backoff: delay = base * 2^(attempt-1) * jitter, capped at 60s.
     EMBED_MAX_RETRIES: int = 5
     EMBED_RETRY_BASE: float = 5.0
@@ -111,8 +109,8 @@ class Settings(BaseSettings):
     # Local dev:   redis://localhost:6379
     # Production:  rediss://default:<password>@<host>.upstash.io:6380  (TLS)
     REDIS_URL:       str = "redis://localhost:6379"
-    ARQ_MAX_JOBS:    int = 2    # max concurrent jobs per worker process
-    ARQ_JOB_TIMEOUT: int = 600  # seconds before a job is killed (10 min)
+    ARQ_MAX_JOBS:    int = 1    # 1 concurrent job to prevent multi-job 429 collisions on free tier
+    ARQ_JOB_TIMEOUT: int = 1800 # 30 min timeout for large files on free tier
     ARQ_MAX_TRIES:   int = 5    # retry attempts before marking as failed
 
     @property
