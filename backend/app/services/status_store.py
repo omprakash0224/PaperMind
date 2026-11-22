@@ -160,16 +160,7 @@ def update_status(document_id: str, updates: dict[str, Any]) -> None:
                        {"status": "completed", "chunks_count": 42}
                        {"status": "failed", "error": "..."}
     """
-    existing = get_status(document_id)
-
-    if existing is None:
-        logger.warning(
-            "update_status: no record found for document_id=%s "
-            "(may have expired or never been set).",
-            document_id,
-        )
-        return
-
+    existing = get_status(document_id) or {"document_id": document_id}
     existing.update(updates)
     set_status(document_id, existing)
 

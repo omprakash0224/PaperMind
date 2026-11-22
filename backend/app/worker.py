@@ -57,7 +57,7 @@ async def run_ingestion(
         job_id, attempt, document_id, filename,
     )
 
-    update_status(document_id, {"status": "processing"})
+    update_status(document_id, {"status": "processing", "user_id": user_id, "filename": filename})
 
     try:
         result = await asyncio.to_thread(
@@ -72,6 +72,8 @@ async def run_ingestion(
             "status":       result["status"],
             "chunks_count": result["chunks_count"],
             "document_id":  result["document_id"],
+            "user_id":      user_id,
+            "filename":     filename,
         })
 
         logger.info(
@@ -82,7 +84,7 @@ async def run_ingestion(
 
     except Exception as exc:
         logger.exception("Job failed | job_id=%s | attempt=%d: %s", job_id, attempt, exc)
-        update_status(document_id, {"status": "failed", "error": str(exc)})
+        update_status(document_id, {"status": "failed", "error": str(exc), "user_id": user_id, "filename": filename})
         raise  # re-raise so ARQ marks the job as failed and schedules a retry
 
 

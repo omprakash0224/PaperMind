@@ -149,7 +149,17 @@ export async function getIngestionStatus(
   documentId: string,
   getToken:   GetToken,
 ): Promise<IngestionStatus> {
-  return apiFetch<IngestionStatus>(`/api/documents/status/${documentId}`, {}, getToken);
+  return apiFetch<IngestionStatus>(
+    `/api/documents/status/${documentId}`,
+    {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+      },
+    },
+    getToken,
+  );
 }
 
 export async function pollUntilComplete(

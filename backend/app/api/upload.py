@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, HTTPException, UploadFile, File, Response, status
 
 from app.config import get_settings
 from app.dependencies import AuthUser
@@ -163,7 +163,7 @@ async def upload_document(
     "/status/{document_id}",
     summary="Poll ingestion status",
 )
-async def get_ingestion_status(document_id: str, current_user: AuthUser) -> dict:
+async def get_ingestion_status(document_id: str, current_user: AuthUser, response: Response) -> dict:
     """
     Return the current ingestion status for a document.
 
@@ -178,6 +178,10 @@ async def get_ingestion_status(document_id: str, current_user: AuthUser) -> dict
       duplicate   -> file was already ingested; existing chunks returned
       failed      -> ingestion failed; 'error' field contains the reason
     """
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
     record = get_status(document_id)
 
     # Return 404 for missing records AND wrong-owner records.
