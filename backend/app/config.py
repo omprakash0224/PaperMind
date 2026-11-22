@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 80
     COLLECTION_NAME: str = "documents"
     GEMINI_MODEL: str = "gemini-2.5-flash"
-    EMBEDDING_MODEL: str = "text-embedding-004"
-    EMBEDDING_DIM: int = 768
+    EMBEDDING_MODEL: str = "gemini-embedding-2"
+    EMBEDDING_DIM: int = 3072
 
     # -- Embedding throughput / rate limiting ---------------------------------
     # Gemini Developer API free tier (text-embedding-004):
